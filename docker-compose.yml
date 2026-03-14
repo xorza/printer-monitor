@@ -1,5 +1,5 @@
 networks:
-    monitor:
+    printer-monitor-net:
 
 services:
     obico-ml-api:
