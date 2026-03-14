@@ -20,4 +20,4 @@ bytes = "1"
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-thiserror = "2.0.18"
+thiserror = "2.0"

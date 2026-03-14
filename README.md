@@ -47,7 +47,7 @@ Edit `.env` with your values:
 | `PRUSALINK_API_KEY` | No* | — | PrusaLink API key |
 | `RTSP_URL` | Yes | — | RTSP camera stream URL |
 | `TELEGRAM_BOT_TOKEN` | Yes | — | Telegram bot token |
-| `TELEGRAM_CHAT_ID` | Yes | — | Telegram chat ID (numeric) |
+| `TELEGRAM_CHAT_ID` | Yes | — | Your numeric chat ID ([get it from @userinfobot](https://t.me/userinfobot)) |
 | `DETECTION_SENSITIVITY` | No | `1.0` | Detection sensitivity multiplier (0.1–5.0) |
 
 \* `PRUSALINK_URL` and `PRUSALINK_API_KEY` must both be set or both omitted. Without them, the service monitors and notifies but cannot pause/resume prints.
