@@ -10,6 +10,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg ca-certificates curl && \
     rm -rf /var/lib/apt/lists/* && \
     useradd --uid 1000 --no-create-home appuser
-COPY --from=builder /app/target/release/prusa-monitor /usr/local/bin/
+COPY --from=builder /app/target/release/printer-monitor /usr/local/bin/
 USER appuser
-CMD ["prusa-monitor"]
+CMD ["printer-monitor"]

@@ -34,8 +34,8 @@ enum MonitorError {
 }
 
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
-const MONITOR_SNAPSHOT_PATH: &str = "/tmp/prusa_snapshot_monitor.jpg";
-const PHOTO_SNAPSHOT_PATH: &str = "/tmp/prusa_snapshot_photo.jpg";
+const MONITOR_SNAPSHOT_PATH: &str = "/tmp/snapshot_monitor.jpg";
+const PHOTO_SNAPSHOT_PATH: &str = "/tmp/snapshot_photo.jpg";
 
 #[derive(Debug, Clone)]
 struct AppState {

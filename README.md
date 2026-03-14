@@ -1,4 +1,4 @@
-# prusa-monitor
+# printer-monitor
 
 Monitors a Prusa Core One 3D printer for print failures using ML-based detection. Captures webcam snapshots, runs them through [Obico](https://www.obico.io/) failure detection, and automatically pauses the print if a failure is detected.
 
@@ -45,7 +45,7 @@ cp .env.example .env
 | `PRUSALINK_API_KEY` | No* | — | PrusaLink API key |
 | `RTSP_URL` | Yes | — | RTSP camera stream URL |
 | `OBICO_URL` | Yes | — | Obico ML API endpoint (use `http://obico-ml-api:3333` with included compose) |
-| `OBICO_IMAGE_HOST` | Yes | — | Image server address as `host:port` (use `prusa-monitor:8099` with included compose) |
+| `OBICO_IMAGE_HOST` | Yes | — | Image server address as `host:port` (use `printer-monitor:8099` with included compose) |
 | `TELEGRAM_BOT_TOKEN` | Yes | — | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | Yes | — | Telegram chat ID (numeric) |
 | `DETECTION_SENSITIVITY` | No | `1.0` | Detection sensitivity multiplier (0.1–5.0) |
@@ -60,14 +60,14 @@ docker compose up -d
 
 This starts two services:
 - **obico-ml-api** — Obico's ML detection model
-- **prusa-monitor** — the monitoring service
+- **printer-monitor** — the monitoring service
 
 ### Use pre-built image
 
 ```yaml
 # docker-compose.yml
 services:
-  prusa-monitor:
+  printer-monitor:
     image: ghcr.io/xorza/printer-monitor:main
     env_file: .env
     # ...

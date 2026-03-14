@@ -1,10 +1,10 @@
 networks:
-    prusa:
+    monitor:
 
 services:
     obico-ml-api:
         image: ghcr.io/gabe565/obico/ml-api
-        container_name: prusa-monitor-obico-ml-api
+        container_name: printer-monitor-obico-ml-api
         hostname: obico-ml-api
         environment:
             DEBUG: "True"
@@ -13,9 +13,13 @@ services:
         restart: unless-stopped
         tty: true
         networks:
-            - prusa
+            - printer-monitor-net
         healthcheck:
-            test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3333/hc/"]
+            test:
+                [
+                    "CMD-SHELL",
+                    "wget --no-verbose --tries=1 --spider http://localhost:3333/hc/",
+                ]
             interval: 30s
             timeout: 10s
             retries: 3
@@ -29,14 +33,14 @@ services:
                 wsgi,
             ]
 
-    prusa-monitor:
-        build: .
-        container_name: prusa-monitor
-        hostname: prusa-monitor
+    printer-monitor:
+        image: ghcr.io/xorza/printer-monitor:main
+        container_name: printer-monitor
+        hostname: printer-monitor
         env_file: .env
         restart: unless-stopped
         networks:
-            - prusa
+            - printer-monitor-net
         depends_on:
             obico-ml-api:
                 condition: service_healthy
