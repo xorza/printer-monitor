@@ -37,6 +37,8 @@ impl Snapshot {
                 "2",
             ])
             .arg(output_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
 
@@ -48,7 +50,13 @@ impl Snapshot {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(std::io::Error::other(format!("ffmpeg failed: {stderr}")));
+            let stderr = stderr.trim();
+            let msg = if stderr.is_empty() {
+                format!("ffmpeg exited with {}", output.status)
+            } else {
+                format!("ffmpeg failed: {stderr}")
+            };
+            return Err(std::io::Error::other(msg));
         }
 
         Ok(())
