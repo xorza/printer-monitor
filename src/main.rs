@@ -277,6 +277,7 @@ async fn handle_command(
                         .await?;
                 }
                 Err(e) => {
+                    error!("Camera error: {e}");
                     bot.send_message(chat, format!("Camera error: {e}\n\n{caption}"))
                         .await?;
                 }
@@ -321,7 +322,10 @@ async fn handle_pause_resume(prusa: &PrusaLink, pause: bool) -> String {
     let action = if pause { "pause" } else { "resume" };
     let status = match prusa.status().await {
         Ok(s) => s,
-        Err(e) => return format!("Failed to get status: {e}"),
+        Err(e) => {
+            error!("PrusaLink status error: {e}");
+            return format!("Failed to get status: {e}");
+        }
     };
     let job = match &status.job {
         Some(j) => j,
@@ -334,7 +338,10 @@ async fn handle_pause_resume(prusa: &PrusaLink, pause: bool) -> String {
     };
     match result {
         Ok(()) => format!("Print {action}d."),
-        Err(e) => format!("Failed to {action}: {e}"),
+        Err(e) => {
+            error!("PrusaLink {action} error: {e}");
+            format!("Failed to {action}: {e}")
+        }
     }
 }
 
@@ -351,7 +358,10 @@ async fn status_caption(state: &AppState) -> String {
                 .unwrap_or_else(|| "No active job".to_string());
             format!("State: {:?}\n{job_info}", status.printer.state)
         }
-        Err(e) => format!("PrusaLink error: {e}"),
+        Err(e) => {
+            error!("PrusaLink status error: {e}");
+            format!("PrusaLink error: {e}")
+        }
     }
 }
 
