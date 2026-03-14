@@ -38,6 +38,9 @@ services:
         container_name: printer-monitor
         hostname: printer-monitor
         env_file: .env
+        environment:
+            OBICO_URL: http://obico-ml-api:3333
+            OBICO_IMAGE_HOST: printer-monitor:8099
         restart: unless-stopped
         networks:
             - printer-monitor-net

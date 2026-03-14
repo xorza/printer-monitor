@@ -1,6 +1,6 @@
 # printer-monitor
 
-Monitors a Prusa Core One 3D printer for print failures using ML-based detection. Captures webcam snapshots, runs them through [Obico](https://www.obico.io/) failure detection, and automatically pauses the print if a failure is detected.
+Monitors a 3D printer for print failures using ML-based detection. Captures webcam snapshots, runs them through [Obico](https://www.obico.io/) failure detection, and automatically pauses the print if a failure is detected.
 
 ## How it works
 
@@ -22,37 +22,39 @@ Detection uses a two-tier escalation — **Warning** (notification only) and **F
 - `/pause` — pause the current print
 - `/resume` — resume a paused print
 
-## Setup
+## Quick start
 
 ### Requirements
 
 - Docker and Docker Compose
-- A Prusa printer with PrusaLink enabled (optional — without it, detection still runs but can't pause)
+- A printer with PrusaLink enabled (optional — without it, detection still runs but can't pause)
 - An RTSP camera pointed at the print bed
 - A Telegram bot token ([create one](https://core.telegram.org/bots#botfather))
 
-### Configuration
-
-Copy `.env.example` to `.env` and fill in:
+### 1. Clone and configure
 
 ```bash
+git clone https://github.com/xorza/printer-monitor.git
+cd printer-monitor
 cp .env.example .env
 ```
+
+Edit `.env` with your values:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `PRUSALINK_URL` | No* | — | PrusaLink API URL (e.g. `http://192.168.0.10`) |
 | `PRUSALINK_API_KEY` | No* | — | PrusaLink API key |
 | `RTSP_URL` | Yes | — | RTSP camera stream URL |
-| `OBICO_URL` | Yes | — | Obico ML API endpoint (use `http://obico-ml-api:3333` with included compose) |
-| `OBICO_IMAGE_HOST` | Yes | — | Image server address as `host:port` (use `printer-monitor:8099` with included compose) |
 | `TELEGRAM_BOT_TOKEN` | Yes | — | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | Yes | — | Telegram chat ID (numeric) |
 | `DETECTION_SENSITIVITY` | No | `1.0` | Detection sensitivity multiplier (0.1–5.0) |
 
 \* `PRUSALINK_URL` and `PRUSALINK_API_KEY` must both be set or both omitted. Without them, the service monitors and notifies but cannot pause/resume prints.
 
-### Run
+The remaining variables (`OBICO_URL`, `OBICO_IMAGE_HOST`) have working defaults for the included Docker Compose setup — no need to change them.
+
+### 2. Run
 
 ```bash
 docker compose up -d
@@ -60,20 +62,11 @@ docker compose up -d
 
 This starts two services:
 - **obico-ml-api** — Obico's ML detection model
-- **printer-monitor** — the monitoring service
+- **printer-monitor** — the monitoring service (pre-built image from `ghcr.io/xorza/printer-monitor:main`)
 
-### Use pre-built image
+### Build from source
 
-```yaml
-# docker-compose.yml
-services:
-  printer-monitor:
-    image: ghcr.io/xorza/printer-monitor:main
-    env_file: .env
-    # ...
-```
-
-## Build from source
+Requires Rust toolchain and ffmpeg installed locally.
 
 ```bash
 cargo build --release
@@ -82,4 +75,4 @@ cargo nextest run
 
 ## License
 
-MIT
+[MIT](LICENSE)
