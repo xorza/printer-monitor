@@ -269,16 +269,15 @@ async fn handle_command(
         Command::Status => {
             bot.send_chat_action(chat, ChatAction::UploadPhoto).await?;
             let path = Path::new(PHOTO_SNAPSHOT_PATH);
+            let caption = status_caption(&state).await;
             match state.snapshot.capture(path).await {
                 Ok(_) => {
-                    let mut req = bot.send_photo(chat, InputFile::file(path));
-                    if let Some(caption) = status_caption(&state).await {
-                        req = req.caption(caption);
-                    }
-                    req.await?;
+                    bot.send_photo(chat, InputFile::file(path))
+                        .caption(caption)
+                        .await?;
                 }
                 Err(e) => {
-                    bot.send_message(chat, format!("Snapshot failed: {e}"))
+                    bot.send_message(chat, format!("Camera error: {e}\n\n{caption}"))
                         .await?;
                 }
             }
@@ -339,15 +338,21 @@ async fn handle_pause_resume(prusa: &PrusaLink, pause: bool) -> String {
     }
 }
 
-async fn status_caption(state: &AppState) -> Option<String> {
-    let prusa = state.prusa.as_ref()?;
-    let status = prusa.status().await.ok()?;
-    let job_info = status
-        .job
-        .as_ref()
-        .map(format_job_info)
-        .unwrap_or_else(|| "No active job".to_string());
-    Some(format!("State: {:?}\n{job_info}", status.printer.state))
+async fn status_caption(state: &AppState) -> String {
+    let Some(prusa) = state.prusa.as_ref() else {
+        return "PrusaLink not configured.".to_string();
+    };
+    match prusa.status().await {
+        Ok(status) => {
+            let job_info = status
+                .job
+                .as_ref()
+                .map(format_job_info)
+                .unwrap_or_else(|| "No active job".to_string());
+            format!("State: {:?}\n{job_info}", status.printer.state)
+        }
+        Err(e) => format!("PrusaLink error: {e}"),
+    }
 }
 
 // --- Helpers ---
