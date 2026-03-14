@@ -15,7 +15,7 @@ use prusalink::{JobStatus, PrusaLink};
 use server::ImageServer;
 use teloxide::dispatching::HandlerExt;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, InputFile};
+use teloxide::types::{ChatAction, InlineKeyboardButton, InputFile};
 use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -130,10 +130,22 @@ async fn run() {
     });
 
     let allowed_chat = state.tg.chat_id();
-    let handler = Update::filter_message()
-        .filter(move |msg: Message| msg.chat.id == allowed_chat)
-        .filter_command::<Command>()
-        .endpoint(handle_command);
+    let handler = dptree::entry()
+        .branch(
+            Update::filter_message()
+                .filter(move |msg: Message| msg.chat.id == allowed_chat)
+                .filter_command::<Command>()
+                .endpoint(handle_command),
+        )
+        .branch(
+            Update::filter_callback_query()
+                .filter(move |q: CallbackQuery| {
+                    q.message
+                        .as_ref()
+                        .is_some_and(|m| m.chat().id == allowed_chat)
+                })
+                .endpoint(handle_callback),
+        );
     let mut dispatcher = Dispatcher::builder(state.tg.bot().clone(), handler)
         .dependencies(dptree::deps![state.clone()])
         .build();
@@ -225,7 +237,23 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
         .map(|j| format!("{}\n", format_job_info(j)))
         .unwrap_or_default();
     let caption = format!("Print failure detected!\n{job_line}Score: {adjusted:.2}\n{action}");
-    state.tg.send_photo(path, &caption).await?;
+
+    let buttons: Vec<InlineKeyboardButton> = if paused {
+        vec![InlineKeyboardButton::callback("Resume", "resume")]
+    } else if state.prusa.is_some() {
+        vec![InlineKeyboardButton::callback("Pause", "pause")]
+    } else {
+        vec![]
+    };
+
+    if buttons.is_empty() {
+        state.tg.send_photo(path, &caption).await?;
+    } else {
+        state
+            .tg
+            .send_photo_with_buttons(path, &caption, buttons)
+            .await?;
+    }
 
     Ok(())
 }
@@ -266,6 +294,38 @@ async fn handle_command(
             }
         }
     }
+    Ok(())
+}
+
+async fn handle_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    state: AppState,
+) -> Result<(), teloxide::RequestError> {
+    let data = q.data.as_deref().unwrap_or("");
+    let pause = match data {
+        "pause" => true,
+        "resume" => false,
+        _ => {
+            bot.answer_callback_query(q.id).await?;
+            return Ok(());
+        }
+    };
+
+    let reply = match &state.prusa {
+        Some(prusa) => handle_pause_resume(prusa, pause).await,
+        None => "PrusaLink not configured.".to_string(),
+    };
+
+    bot.answer_callback_query(q.id.clone()).text(&reply).await?;
+
+    // Remove the inline keyboard after action
+    if let Some(msg) = q.message {
+        bot.edit_message_reply_markup(msg.chat().id, msg.id())
+            .await
+            .ok();
+    }
+
     Ok(())
 }
 
