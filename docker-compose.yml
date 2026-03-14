@@ -1,0 +1,48 @@
+networks:
+    prusa:
+
+services:
+    obico-ml-api:
+        image: ghcr.io/gabe565/obico/ml-api
+        container_name: prusa-monitor-obico-ml-api
+        hostname: obico-ml-api
+        environment:
+            DEBUG: "True"
+            FLASK_APP: "server.py"
+            # ML_API_TOKEN:
+        restart: unless-stopped
+        tty: true
+        networks:
+            - prusa
+        healthcheck:
+            test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3333/hc/"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 30s
+        command:
+            [
+                gunicorn,
+                --bind=0.0.0.0:3333,
+                --workers=1,
+                --access-logfile=-,
+                wsgi,
+            ]
+
+    prusa-monitor:
+        build: .
+        container_name: prusa-monitor
+        hostname: prusa-monitor
+        env_file: .env
+        restart: unless-stopped
+        networks:
+            - prusa
+        depends_on:
+            obico-ml-api:
+                condition: service_healthy
+        healthcheck:
+            test: ["CMD-SHELL", "curl -f http://${OBICO_IMAGE_HOST}/health"]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 10s
