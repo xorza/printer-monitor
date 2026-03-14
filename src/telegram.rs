@@ -29,26 +29,16 @@ impl Telegram {
         &self,
         photo_path: &Path,
         caption: &str,
+        buttons: &[InlineKeyboardButton],
     ) -> Result<(), teloxide::RequestError> {
-        self.bot
+        let mut req = self
+            .bot
             .send_photo(self.chat_id, InputFile::file(photo_path))
-            .caption(caption)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn send_photo_with_buttons(
-        &self,
-        photo_path: &Path,
-        caption: &str,
-        buttons: Vec<InlineKeyboardButton>,
-    ) -> Result<(), teloxide::RequestError> {
-        let keyboard = InlineKeyboardMarkup::new(vec![buttons]);
-        self.bot
-            .send_photo(self.chat_id, InputFile::file(photo_path))
-            .caption(caption)
-            .reply_markup(keyboard)
-            .await?;
+            .caption(caption);
+        if !buttons.is_empty() {
+            req = req.reply_markup(InlineKeyboardMarkup::new(vec![buttons.to_vec()]));
+        }
+        req.await?;
         Ok(())
     }
 }
