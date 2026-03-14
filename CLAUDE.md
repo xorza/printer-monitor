@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Rust service monitoring a Prusa Core One 3D printer for print failures. Pipeline: poll PrusaLink status → capture RTSP webcam snapshot → run through Obico ML detection → if failure detected, pause print via PrusaLink and notify via Telegram bot.
 
-Secrets (PrusaLink API key, Telegram bot token, Obico endpoint, RTSP URL) come from environment variables or config file. Deployed on beelink-ser5 as a systemd service (see parent `~/CLAUDE.md`).
+Secrets (PrusaLink API key, Telegram bot token, Obico endpoint, RTSP URL) come from environment variables. Deployed via Docker Compose.
 
 ## Commands
 
