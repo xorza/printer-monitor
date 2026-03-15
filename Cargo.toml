@@ -21,3 +21,8 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2.0"
+retina = "0.4"
+openh264 = "0.9"
+jpeg-encoder = "0.7"
+url = "2.5"
+futures = "0.3"

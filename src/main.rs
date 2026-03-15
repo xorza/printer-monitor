@@ -2,6 +2,7 @@ pub mod config;
 pub mod detection;
 pub mod obico;
 pub mod prusalink;
+pub mod rtsp_capture;
 pub mod server;
 pub mod snapshot;
 pub mod telegram;
