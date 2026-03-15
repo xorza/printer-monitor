@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl && \
     rm -rf /var/lib/apt/lists/* && \
     useradd --uid 1000 --no-create-home appuser
+RUN mkdir /data && chown appuser:appuser /data
 COPY --from=builder /app/target/release/printer-monitor /usr/local/bin/
 USER appuser
+WORKDIR /data
 CMD ["printer-monitor"]
