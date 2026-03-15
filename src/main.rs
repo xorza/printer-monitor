@@ -151,8 +151,18 @@ async fn run() {
         .build();
     let shutdown_token = dispatcher.shutdown_token();
 
-    tokio::spawn(async move {
-        dispatcher.dispatch().await;
+    tokio::spawn({
+        let token = token.clone();
+        async move {
+            loop {
+                dispatcher.dispatch().await;
+                if token.is_cancelled() {
+                    break;
+                }
+                error!("Telegram dispatcher stopped, restarting in 5s...");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
     });
 
     loop {
