@@ -222,11 +222,11 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
             info!("Detection: safe");
             return Ok(());
         }
-        DetectionResult::Warning { adjusted } => {
+        DetectionResult::Warning { score: adjusted } => {
             warn!(adjusted, "Detection: warning");
             (adjusted, false)
         }
-        DetectionResult::Failing { adjusted } => {
+        DetectionResult::Failing { score: adjusted } => {
             warn!(adjusted, "Detection: failing");
             let paused = if let Some((prusa, job)) = state.prusa.as_ref().zip(job) {
                 prusa.pause(job.id).await?;
@@ -357,8 +357,11 @@ async fn handle_pause_resume(prusa: &PrusaLink, pause: bool) -> String {
 }
 
 async fn status_caption(state: &AppState) -> String {
+    let score = state.detection.lock().await.current_score();
+    let score_line = format!("Detection score: {score:.2}");
+
     let Some(prusa) = state.prusa.as_ref() else {
-        return "PrusaLink not configured.".to_string();
+        return format!("PrusaLink not configured.\n{score_line}");
     };
     match prusa.status().await {
         Ok(status) => {
@@ -367,11 +370,14 @@ async fn status_caption(state: &AppState) -> String {
                 .as_ref()
                 .map(format_job_info)
                 .unwrap_or_else(|| "No active job".to_string());
-            format!("State: {:?}\n{job_info}", status.printer.state)
+            format!(
+                "State: {:?}\n{job_info}\n{score_line}",
+                status.printer.state
+            )
         }
         Err(e) => {
             error!("PrusaLink status error: {e}");
-            format!("PrusaLink error: {e}")
+            format!("PrusaLink error: {e}\n{score_line}")
         }
     }
 }

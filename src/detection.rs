@@ -17,8 +17,8 @@ const ESCALATING_FACTOR: f64 = 1.75;
 #[derive(Debug, PartialEq)]
 pub enum DetectionResult {
     Safe,
-    Warning { adjusted: f64 },
-    Failing { adjusted: f64 },
+    Warning { score: f64 },
+    Failing { score: f64 },
 }
 
 #[derive(Debug)]
@@ -47,6 +47,10 @@ impl DetectionState {
 
     /// Reset short-term state (EWM, rolling short, frame count).
     /// Call when printer stops printing so next print starts clean.
+    pub fn current_score(&self) -> f64 {
+        (self.ewm_mean - self.rolling_mean_long) * self.sensitivity
+    }
+
     pub fn reset_short_term(&mut self) {
         self.ewm_mean = 0.0;
         self.rolling_mean_short = 0.0;
@@ -90,20 +94,16 @@ impl DetectionState {
             return DetectionResult::Safe;
         }
 
-        let base_adjusted = (self.ewm_mean - self.rolling_mean_long) * self.sensitivity;
+        let score = self.current_score();
 
         // Check for Failing (pause threshold) — needs 1.75x higher signal
-        if self.is_failing(base_adjusted / ESCALATING_FACTOR) {
-            return DetectionResult::Failing {
-                adjusted: base_adjusted,
-            };
+        if self.is_failing(score / ESCALATING_FACTOR) {
+            return DetectionResult::Failing { score };
         }
 
         // Check for Warning — escalating_factor = 1.0
-        if self.is_failing(base_adjusted) {
-            return DetectionResult::Warning {
-                adjusted: base_adjusted,
-            };
+        if self.is_failing(score) {
+            return DetectionResult::Warning { score };
         }
 
         DetectionResult::Safe
