@@ -217,24 +217,24 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
         .await
         .update(&obico_result.detections, job.map(|j| j.id));
 
-    let (adjusted, paused) = match result {
+    let (score, paused) = match result {
         DetectionResult::Safe => {
             info!("Detection: safe");
             return Ok(());
         }
-        DetectionResult::Warning { score: adjusted } => {
-            warn!(adjusted, "Detection: warning");
-            (adjusted, false)
+        DetectionResult::Warning { score } => {
+            warn!(score, "Detection: warning");
+            (score, false)
         }
-        DetectionResult::Failing { score: adjusted } => {
-            warn!(adjusted, "Detection: failing");
+        DetectionResult::Failing { score } => {
+            warn!(score, "Detection: failing");
             let paused = if let Some((prusa, job)) = state.prusa.as_ref().zip(job) {
                 prusa.pause(job.id).await?;
                 true
             } else {
                 false
             };
-            (adjusted, paused)
+            (score, paused)
         }
     };
 
@@ -246,7 +246,7 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
     let job_line = job
         .map(|j| format!("{}\n", format_job_info(j)))
         .unwrap_or_default();
-    let caption = format!("Print failure detected!\n{job_line}Score: {adjusted:.2}\n{action}");
+    let caption = format!("Print failure detected!\n{job_line}Score: {score:.2}\n{action}");
 
     let buttons = match (paused, state.prusa.is_some()) {
         (true, _) => vec![InlineKeyboardButton::callback("Resume", "resume")],
