@@ -269,8 +269,9 @@ async fn handle_command(
         Command::Status => {
             bot.send_chat_action(chat, ChatAction::UploadPhoto).await?;
             let path = Path::new(PHOTO_SNAPSHOT_PATH);
-            let caption = status_caption(&state).await;
-            match state.snapshot.capture(path).await {
+            let (caption, snapshot) =
+                tokio::join!(status_caption(&state), state.snapshot.capture(path));
+            match snapshot {
                 Ok(_) => {
                     bot.send_photo(chat, InputFile::file(path))
                         .caption(caption)
