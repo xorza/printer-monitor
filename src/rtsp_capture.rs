@@ -164,7 +164,7 @@ mod tests {
     #[ignore] // requires live camera at prusacam.lan
     async fn capture_to_file() {
         let cap = RtspCapture::new("rtsp://prusacam.lan/live");
-        let path = Path::new("/tmp/rtsp_capture_test.jpg");
+        let path = Path::new("./rtsp_capture_test.jpg");
         cap.capture_to_file(path).await.unwrap();
 
         let metadata = std::fs::metadata(path).unwrap();
@@ -173,6 +173,6 @@ mod tests {
             "JPEG too small: {} bytes",
             metadata.len()
         );
-        std::fs::remove_file(path).ok();
+        // std::fs::remove_file(path).ok();
     }
 }

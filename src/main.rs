@@ -4,10 +4,8 @@ pub mod obico;
 pub mod prusalink;
 pub mod rtsp_capture;
 pub mod server;
-pub mod snapshot;
 pub mod telegram;
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +14,7 @@ use prusalink::{JobStatus, PrusaLink};
 use server::ImageServer;
 use teloxide::dispatching::HandlerExt;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, InlineKeyboardButton, InputFile};
+use teloxide::types::{ChatAction, InlineKeyboardButton};
 use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -26,8 +24,8 @@ use tracing::{error, info, warn};
 enum MonitorError {
     #[error("PrusaLink: {0}")]
     PrusaLink(#[from] reqwest::Error),
-    #[error("Snapshot: {0}")]
-    Snapshot(#[from] std::io::Error),
+    #[error("Capture: {0}")]
+    Capture(#[from] rtsp_capture::CaptureError),
     #[error("Obico: {0}")]
     Obico(#[from] obico::ObicoError),
     #[error("Telegram: {0}")]
@@ -35,15 +33,13 @@ enum MonitorError {
 }
 
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
-const MONITOR_SNAPSHOT_PATH: &str = "/tmp/snapshot_monitor.jpg";
-const PHOTO_SNAPSHOT_PATH: &str = "/tmp/snapshot_photo.jpg";
 
 #[derive(Debug, Clone)]
 struct AppState {
     prusa: Option<Arc<PrusaLink>>,
     obico: Arc<obico::Obico>,
     tg: Arc<telegram::Telegram>,
-    snapshot: Arc<snapshot::Snapshot>,
+    camera: Arc<rtsp_capture::RtspCapture>,
     image_server: Arc<ImageServer>,
     detection: Arc<Mutex<DetectionState>>,
 }
@@ -108,7 +104,7 @@ async fn run() {
             config.telegram_bot_token,
             config.telegram_chat_id,
         )),
-        snapshot: Arc::new(snapshot::Snapshot::new(config.rtsp_url)),
+        camera: Arc::new(rtsp_capture::RtspCapture::new(&config.rtsp_url)),
         image_server: Arc::new(image_server),
         detection: Arc::new(Mutex::new(DetectionState::new(
             config.detection_sensitivity,
@@ -204,11 +200,8 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
         info!(job_id = job.id, "{}", format_job_info(job));
     }
 
-    let path = Path::new(MONITOR_SNAPSHOT_PATH);
-    state.snapshot.capture(path).await?;
-
-    let image_data = tokio::fs::read(path).await?;
-    state.image_server.set_image(image_data);
+    let jpeg = state.camera.capture().await?;
+    state.image_server.set_image(jpeg.clone());
 
     let obico_result = state.obico.detect().await?;
 
@@ -254,7 +247,7 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
         (false, true) => vec![InlineKeyboardButton::callback("Pause", "pause")],
         (false, false) => vec![],
     };
-    state.tg.send_photo(path, &caption, &buttons).await?;
+    state.tg.send_photo(jpeg, &caption, &buttons).await?;
 
     Ok(())
 }
@@ -279,14 +272,16 @@ async fn handle_command(
         }
         Command::Status => {
             bot.send_chat_action(chat, ChatAction::UploadPhoto).await?;
-            let path = Path::new(PHOTO_SNAPSHOT_PATH);
             let (caption, snapshot) =
-                tokio::join!(status_caption(&state), state.snapshot.capture(path));
+                tokio::join!(status_caption(&state), state.camera.capture());
             match snapshot {
-                Ok(_) => {
-                    bot.send_photo(chat, InputFile::file(path))
-                        .caption(caption)
-                        .await?;
+                Ok(jpeg) => {
+                    bot.send_photo(
+                        chat,
+                        teloxide::types::InputFile::memory(jpeg).file_name("snapshot.jpg"),
+                    )
+                    .caption(caption)
+                    .await?;
                 }
                 Err(e) => {
                     error!("Camera error: {e}");

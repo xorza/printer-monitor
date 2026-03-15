@@ -1,5 +1,4 @@
 use reqwest::Client;
-use std::path::Path;
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile};
 
@@ -27,13 +26,13 @@ impl Telegram {
 
     pub async fn send_photo(
         &self,
-        photo_path: &Path,
+        jpeg: Vec<u8>,
         caption: &str,
         buttons: &[InlineKeyboardButton],
     ) -> Result<(), teloxide::RequestError> {
         let mut req = self
             .bot
-            .send_photo(self.chat_id, InputFile::file(photo_path))
+            .send_photo(self.chat_id, InputFile::memory(jpeg).file_name("snapshot.jpg"))
             .caption(caption);
         if !buttons.is_empty() {
             req = req.reply_markup(InlineKeyboardMarkup::new(vec![buttons.to_vec()]));
