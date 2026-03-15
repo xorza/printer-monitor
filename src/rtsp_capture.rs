@@ -8,6 +8,7 @@ use retina::client::{PlayOptions, Session, SessionOptions, SetupOptions, Transpo
 use retina::codec::{CodecItem, FrameFormat};
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+const JPEG_QUALITY: u8 = 85;
 
 #[derive(Debug)]
 pub struct RtspCapture {
@@ -24,13 +25,21 @@ impl RtspCapture {
         Self { url }
     }
 
-    pub async fn capture(&self, output_path: &Path) -> Result<(), CaptureError> {
-        tokio::time::timeout(CAPTURE_TIMEOUT, self.capture_inner(output_path))
+    /// Capture a single frame and save as JPEG to file.
+    pub async fn capture_to_file(&self, output_path: &Path) -> Result<(), CaptureError> {
+        let jpeg = self.capture().await?;
+        tokio::fs::write(output_path, &jpeg).await?;
+        Ok(())
+    }
+
+    /// Capture a single frame and return JPEG bytes.
+    pub async fn capture(&self) -> Result<Vec<u8>, CaptureError> {
+        tokio::time::timeout(CAPTURE_TIMEOUT, self.capture_inner())
             .await
             .map_err(|_| CaptureError::Timeout)?
     }
 
-    async fn capture_inner(&self, output_path: &Path) -> Result<(), CaptureError> {
+    async fn capture_inner(&self) -> Result<Vec<u8>, CaptureError> {
         let session_group = Arc::new(retina::client::SessionGroup::default());
         let options = SessionOptions::default()
             .session_group(session_group.clone())
@@ -54,55 +63,53 @@ impl RtspCapture {
             .await?;
 
         let mut demuxed = session.play(PlayOptions::default()).await?.demuxed()?;
-        let result = self.read_first_frame(&mut demuxed, output_path).await;
+        let result = decode_first_frame(&mut demuxed).await;
 
         drop(demuxed);
         let _ = session_group.await_teardown().await;
 
         result
     }
+}
 
-    async fn read_first_frame(
-        &self,
-        demuxed: &mut retina::client::Demuxed,
-        output_path: &Path,
-    ) -> Result<(), CaptureError> {
-        let mut decoder = openh264::decoder::Decoder::new()?;
-        let mut got_keyframe = false;
+async fn decode_first_frame(
+    demuxed: &mut retina::client::Demuxed,
+) -> Result<Vec<u8>, CaptureError> {
+    let mut decoder = openh264::decoder::Decoder::new()?;
+    let mut got_keyframe = false;
 
-        while let Some(item) = demuxed.next().await {
-            let frame = match item? {
-                CodecItem::VideoFrame(f) => f,
-                _ => continue,
-            };
+    while let Some(item) = demuxed.next().await {
+        let frame = match item? {
+            CodecItem::VideoFrame(f) => f,
+            _ => continue,
+        };
 
-            if frame.is_random_access_point() {
-                got_keyframe = true;
-            }
-            if !got_keyframe {
-                continue;
-            }
-
-            let yuv = match decoder.decode(frame.data()) {
-                Ok(Some(yuv)) => yuv,
-                Ok(None) => continue,
-                Err(_) if !frame.is_random_access_point() => continue,
-                Err(e) => return Err(e.into()),
-            };
-
-            let (w, h) = yuv.dimensions();
-            let mut rgb = vec![0u8; w * h * 3];
-            yuv.write_rgb8(&mut rgb);
-
-            let file = std::fs::File::create(output_path)?;
-            let encoder = jpeg_encoder::Encoder::new(file, 85);
-            encoder.encode(&rgb, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)?;
-
-            return Ok(());
+        if frame.is_random_access_point() {
+            got_keyframe = true;
+        }
+        if !got_keyframe {
+            continue;
         }
 
-        Err(CaptureError::NoFrame)
+        let yuv = match decoder.decode(frame.data()) {
+            Ok(Some(yuv)) => yuv,
+            Ok(None) => continue,
+            Err(_) if !frame.is_random_access_point() => continue,
+            Err(e) => return Err(e.into()),
+        };
+
+        let (w, h) = yuv.dimensions();
+        let mut rgb = vec![0u8; w * h * 3];
+        yuv.write_rgb8(&mut rgb);
+
+        let mut jpeg = Vec::new();
+        let encoder = jpeg_encoder::Encoder::new(&mut jpeg, JPEG_QUALITY);
+        encoder.encode(&rgb, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)?;
+
+        return Ok(jpeg);
     }
+
+    Err(CaptureError::NoFrame)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -147,10 +154,18 @@ mod tests {
 
     #[tokio::test]
     #[ignore] // requires live camera at prusacam.lan
-    async fn capture_live_frame() {
+    async fn capture_to_memory() {
         let cap = RtspCapture::new("rtsp://prusacam.lan/live");
-        let path = Path::new("./rtsp_capture_test.jpg");
-        cap.capture(path).await.unwrap();
+        let jpeg = cap.capture().await.unwrap();
+        assert!(jpeg.len() > 1000, "JPEG too small: {} bytes", jpeg.len());
+    }
+
+    #[tokio::test]
+    #[ignore] // requires live camera at prusacam.lan
+    async fn capture_to_file() {
+        let cap = RtspCapture::new("rtsp://prusacam.lan/live");
+        let path = Path::new("/tmp/rtsp_capture_test.jpg");
+        cap.capture_to_file(path).await.unwrap();
 
         let metadata = std::fs::metadata(path).unwrap();
         assert!(
@@ -158,7 +173,6 @@ mod tests {
             "JPEG too small: {} bytes",
             metadata.len()
         );
-
-        //std::fs::remove_file(path).ok();
+        std::fs::remove_file(path).ok();
     }
 }
