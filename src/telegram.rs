@@ -32,7 +32,10 @@ impl Telegram {
     ) -> Result<(), teloxide::RequestError> {
         let mut req = self
             .bot
-            .send_photo(self.chat_id, InputFile::memory(jpeg).file_name("snapshot.jpg"))
+            .send_photo(
+                self.chat_id,
+                InputFile::memory(jpeg).file_name("snapshot.jpg"),
+            )
             .caption(caption);
         if !buttons.is_empty() {
             req = req.reply_markup(InlineKeyboardMarkup::new(vec![buttons.to_vec()]));
