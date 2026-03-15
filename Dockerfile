@@ -7,7 +7,7 @@ RUN touch src/main.rs && cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg ca-certificates curl && \
+    ca-certificates curl && \
     rm -rf /var/lib/apt/lists/* && \
     useradd --uid 1000 --no-create-home appuser
 COPY --from=builder /app/target/release/printer-monitor /usr/local/bin/
