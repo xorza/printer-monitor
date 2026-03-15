@@ -41,6 +41,7 @@ services:
         environment:
             OBICO_URL: http://obico-ml-api:3333
             OBICO_IMAGE_HOST: printer-monitor:8099
+            RUST_LOG: info
         volumes:
             - ./volume/data:/data
         restart: unless-stopped
