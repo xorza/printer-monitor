@@ -62,11 +62,9 @@ fn streaming_sma(mean: f64, sample: f64, count: u64, window: u64) -> f64 {
 const EWM_ALPHA: f64 = 2.0 / (12.0 + 1.0); // span=12, α=0.1538
 const ROLLING_WIN_SHORT: u64 = 310; // ~50 min at 10s
 const ROLLING_WIN_LONG: u64 = 7200; // ~20 hours at 10s
-const GRACE_FRAMES: u64 = 30; // ~5 min at 10s
-const THRESHOLD_LOW: f64 = 0.38;
-const THRESHOLD_HIGH: f64 = 0.78;
-const SHORT_MULTIPLE: f64 = 3.8;
-const ESCALATING_FACTOR: f64 = 1.75;
+const GRACE_FRAMES: u64 = 10; // ~2.5 min at 15s
+const THRESHOLD_WARNING: f64 = 0.35;
+const THRESHOLD_FAILING: f64 = 0.55;
 
 #[derive(Debug, PartialEq)]
 pub enum DetectionResult {
@@ -149,9 +147,9 @@ impl DetectionState {
         // Grace period
         let result = if self.frame_count <= GRACE_FRAMES {
             DetectionResult::Safe
-        } else if self.is_failing(score / ESCALATING_FACTOR) {
+        } else if score >= THRESHOLD_FAILING {
             DetectionResult::Failing { score }
-        } else if self.is_failing(score) {
+        } else if score >= THRESHOLD_WARNING {
             DetectionResult::Warning { score }
         } else {
             DetectionResult::Safe
@@ -169,17 +167,6 @@ impl DetectionState {
         );
 
         result
-    }
-
-    fn is_failing(&self, adjusted: f64) -> bool {
-        if adjusted < THRESHOLD_LOW {
-            return false;
-        }
-        if adjusted > THRESHOLD_HIGH {
-            return true;
-        }
-        let rolling_thresh = (self.rolling_mean_short - self.rolling_mean_long) * SHORT_MULTIPLE;
-        adjusted > rolling_thresh
     }
 }
 
@@ -210,12 +197,12 @@ mod tests {
 
         // Multiple detections per frame (p=2.5) — high enough to trigger after grace
         let high_dets = vec![detection(0.85), detection(0.85), detection(0.80)];
-        // During grace period (30 frames) → always Safe
-        for _ in 0..30 {
+        // During grace period (10 frames) → always Safe
+        for _ in 0..10 {
             let result = state.update(&high_dets, None);
             assert_eq!(result, DetectionResult::Safe);
         }
-        // Frame 31 exits grace period and should trigger
+        // Frame 11 exits grace period and should trigger
         let result = state.update(&high_dets, None);
         assert_ne!(result, DetectionResult::Safe);
     }
@@ -269,10 +256,8 @@ mod tests {
         }
         state.reset_short_term();
 
-        // Phase 1: p=1.2 triggers Warning but not Failing
-        // After grace: ewm≈1.2, long≈0.16, adjusted≈1.04 → >0.78 → Warning
-        // Failing: adjusted/1.75≈0.59, middle zone, rolling_thresh≈(1.2-0.16)*3.8≈3.96 → not Failing
-        let moderate_dets = vec![detection(0.6), detection(0.6)];
+        // Phase 1: p=0.6 triggers Warning (score ≥ 0.35) but not Failing (< 0.55)
+        let moderate_dets = vec![detection(0.3), detection(0.3)];
         let mut saw_warning = false;
         for _ in 0..60 {
             if matches!(
@@ -283,9 +268,9 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_warning, "should have seen Warning with p=1.2");
+        assert!(saw_warning, "should have seen Warning with p=0.6");
 
-        // Phase 2: ramp to p=2.5, Failing requires adjusted/1.75 > 0.78
+        // Phase 2: ramp to p=2.5, score ≥ 0.55 triggers Failing
         let high_dets = vec![detection(0.85), detection(0.85), detection(0.80)];
         let mut saw_failing = false;
         for _ in 0..60 {
@@ -304,7 +289,7 @@ mod tests {
     fn single_spike_then_low_returns_to_safe() {
         let mut state = DetectionState::new(1.0);
         // Build up past grace period with low values
-        for _ in 0..35 {
+        for _ in 0..15 {
             state.update(&detections_with_confidence(0.0), None);
         }
 
@@ -312,7 +297,7 @@ mod tests {
         let result = state.update(&detections_with_confidence(0.95), None);
         // With rolling_mean_long near 0, ewm after one spike:
         // ewm = 0.95 * 0.1538 = 0.146 (rest was ~0)
-        // adjusted = 0.146 - ~0 = 0.146, below THRESHOLD_LOW (0.38)
+        // score = 0.146 - ~0 = 0.146, below THRESHOLD_WARNING (0.35)
         assert_eq!(result, DetectionResult::Safe);
 
         // Follow with zeros — should stay safe
@@ -407,7 +392,7 @@ mod tests {
         for _ in 0..50 {
             state.update(&detections_with_confidence(0.5), None);
         }
-        // adjusted = ewm(~0.5) - rolling_mean_long(~0.3) = ~0.2, below THRESHOLD_LOW
+        // score = ewm(~0.5) - rolling_mean_long(~0.3) = ~0.2, below THRESHOLD_WARNING
         let result = state.update(&detections_with_confidence(0.5), None);
         assert_eq!(
             result,
