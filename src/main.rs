@@ -12,13 +12,15 @@ use std::time::Duration;
 use detection::{DetectionResult, DetectionState};
 use prusalink::{JobStatus, PrusaLink};
 use server::ImageServer;
-use teloxide::dispatching::HandlerExt;
+use teloxide::dispatching::{DefaultKey, HandlerExt, ShutdownToken};
 use teloxide::prelude::*;
 use teloxide::types::{ChatAction, InlineKeyboardButton};
 use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+// --- Types ---
 
 #[derive(Debug, thiserror::Error)]
 enum MonitorError {
@@ -55,7 +57,9 @@ enum Command {
     Status,
 }
 
-// --- Entry points ---
+type SharedShutdownToken = Arc<Mutex<Option<ShutdownToken>>>;
+
+// --- Entry point ---
 
 fn main() {
     let _ = dotenvy::dotenv();
@@ -73,7 +77,6 @@ fn main() {
 
 async fn run() {
     let config = config::Config::from_env();
-
     let token = CancellationToken::new();
 
     let image_server = ImageServer::start(&config.obico_image_host, token.clone()).await;
@@ -111,21 +114,75 @@ async fn run() {
         ))),
     };
 
-    // Shutdown on SIGTERM (Docker) or Ctrl+C
+    spawn_signal_handler(&token);
+    let shutdown_token = spawn_telegram_dispatcher(&state, &token);
+
+    loop {
+        if let Err(e) = monitor_cycle(&state).await {
+            error!("Monitor error: {e}");
+        }
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+        }
+    }
+
+    if let Some(token) = shutdown_token.lock().await.take() {
+        match token.shutdown() {
+            Ok(fut) => fut.await,
+            Err(e) => error!("Bot shutdown error: {e:?}"),
+        }
+    }
+
+    info!("Shutdown complete.");
+}
+
+// --- Signal handling ---
+
+fn spawn_signal_handler(token: &CancellationToken) {
+    let token = token.clone();
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        tokio::select! {
+            _ = ctrl_c => info!("Received SIGINT, shutting down..."),
+            _ = sigterm.recv() => info!("Received SIGTERM, shutting down..."),
+        }
+        token.cancel();
+    });
+}
+
+// --- Telegram dispatcher ---
+
+fn spawn_telegram_dispatcher(state: &AppState, cancel: &CancellationToken) -> SharedShutdownToken {
+    let shutdown_token: SharedShutdownToken = Arc::new(Mutex::new(None));
+
     tokio::spawn({
-        let token = token.clone();
+        let cancel = cancel.clone();
+        let state = state.clone();
+        let shutdown_token = shutdown_token.clone();
         async move {
-            let ctrl_c = tokio::signal::ctrl_c();
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-            tokio::select! {
-                _ = ctrl_c => info!("Received SIGINT, shutting down..."),
-                _ = sigterm.recv() => info!("Received SIGTERM, shutting down..."),
+            loop {
+                let mut dispatcher = build_dispatcher(&state);
+                *shutdown_token.lock().await = Some(dispatcher.shutdown_token());
+                let result = tokio::task::spawn(async move { dispatcher.dispatch().await }).await;
+                if cancel.is_cancelled() {
+                    break;
+                }
+                match result {
+                    Ok(()) => error!("Telegram dispatcher stopped, restarting in 5s..."),
+                    Err(e) => error!("Telegram dispatcher panicked: {e}, restarting in 5s..."),
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
-            token.cancel();
         }
     });
 
+    shutdown_token
+}
+
+fn build_dispatcher(state: &AppState) -> Dispatcher<Bot, teloxide::RequestError, DefaultKey> {
     let allowed_chat = state.tg.chat_id();
     let handler = dptree::entry()
         .branch(
@@ -143,41 +200,9 @@ async fn run() {
                 })
                 .endpoint(handle_callback),
         );
-    let mut dispatcher = Dispatcher::builder(state.tg.bot().clone(), handler)
+    Dispatcher::builder(state.tg.bot().clone(), handler)
         .dependencies(dptree::deps![state.clone()])
-        .build();
-    let shutdown_token = dispatcher.shutdown_token();
-
-    tokio::spawn({
-        let token = token.clone();
-        async move {
-            loop {
-                dispatcher.dispatch().await;
-                if token.is_cancelled() {
-                    break;
-                }
-                error!("Telegram dispatcher stopped, restarting in 5s...");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    });
-
-    loop {
-        if let Err(e) = monitor_cycle(&state).await {
-            error!("Monitor error: {e}");
-        }
-        tokio::select! {
-            _ = token.cancelled() => break,
-            _ = tokio::time::sleep(POLL_INTERVAL) => {}
-        }
-    }
-
-    match shutdown_token.shutdown() {
-        Ok(fut) => fut.await,
-        Err(e) => error!("Bot shutdown error: {e:?}"),
-    }
-
-    info!("Shutdown complete.");
+        .build()
 }
 
 // --- Monitor loop ---
@@ -217,14 +242,19 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
             return Ok(());
         }
         DetectionResult::Warning { score } => {
-            warn!(score, "Detection: warning");
+            error!(score, "Detection: warning");
             (score, false)
         }
         DetectionResult::Failing { score } => {
-            warn!(score, "Detection: failing");
+            error!(score, "Detection: failing — attempting pause");
             let paused = if let Some((prusa, job)) = state.prusa.as_ref().zip(job) {
-                prusa.pause(job.id).await?;
-                true
+                match prusa.pause(job.id).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        error!("Failed to pause print: {e}");
+                        false
+                    }
+                }
             } else {
                 false
             };
@@ -313,7 +343,6 @@ async fn handle_callback(
         None => "PrusaLink not configured.".to_string(),
     };
 
-    // Remove the inline keyboard after action
     if let Some(msg) = &q.message {
         bot.edit_message_reply_markup(msg.chat().id, msg.id())
             .await
