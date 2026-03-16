@@ -34,7 +34,8 @@ enum MonitorError {
     Telegram(#[from] teloxide::RequestError),
 }
 
-const POLL_INTERVAL: Duration = Duration::from_secs(10);
+const POLL_TARGET: Duration = Duration::from_secs(10);
+const POLL_MIN_SLEEP: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 struct AppState {
@@ -118,12 +119,16 @@ async fn run() {
     let shutdown_token = spawn_telegram_dispatcher(&state, &token);
 
     loop {
+        let started = tokio::time::Instant::now();
         if let Err(e) = monitor_cycle(&state).await {
             error!("Monitor error: {e}");
         }
+        let sleep = POLL_TARGET
+            .saturating_sub(started.elapsed())
+            .max(POLL_MIN_SLEEP);
         tokio::select! {
             _ = token.cancelled() => break,
-            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+            _ = tokio::time::sleep(sleep) => {}
         }
     }
 
