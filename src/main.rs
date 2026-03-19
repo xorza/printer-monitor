@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use detection::{DetectionResult, DetectionState};
-use prusalink::{JobStatus, PrusaLink};
+use prusalink::{JobStatus, PrinterState, PrusaLink};
 use server::ImageServer;
 use teloxide::dispatching::{DefaultKey, HandlerExt, ShutdownToken};
 use teloxide::prelude::*;
@@ -45,6 +45,7 @@ struct AppState {
     camera: Arc<rtsp_capture::RtspCapture>,
     image_server: Arc<ImageServer>,
     detection: Arc<Mutex<DetectionState>>,
+    prev_state: Arc<Mutex<PrinterState>>,
 }
 
 #[derive(BotCommands, Clone, Debug)]
@@ -113,6 +114,7 @@ async fn run() {
         detection: Arc::new(Mutex::new(DetectionState::new(
             config.detection_sensitivity,
         ))),
+        prev_state: Arc::new(Mutex::new(PrinterState::Idle)),
     };
 
     spawn_signal_handler(&token);
@@ -215,9 +217,21 @@ fn build_dispatcher(state: &AppState) -> Dispatcher<Bot, teloxide::RequestError,
 async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
     let status = if let Some(prusa) = &state.prusa {
         let s = prusa.status().await?;
-        info!(state = ?s.printer.state, "Printer status");
-        if s.printer.state != prusalink::PrinterState::Printing {
+        let current = s.printer.state;
+        info!(state = ?current, "Printer status");
+
+        let mut prev = state.prev_state.lock().await;
+        let was_printing = *prev == PrinterState::Printing;
+        *prev = current;
+        drop(prev);
+
+        if current != PrinterState::Printing {
             state.detection.lock().await.reset_short_term();
+            if was_printing {
+                let msg = format!("Print stopped — printer is now {current:?}");
+                info!("{msg}");
+                state.tg.send_message(&msg).await?;
+            }
             return Ok(());
         }
         Some(s)

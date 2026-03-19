@@ -19,7 +19,7 @@ pub struct PrinterStatus {
     pub state: PrinterState,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PrinterState {
     Idle,

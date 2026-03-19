@@ -24,6 +24,11 @@ impl Telegram {
         self.chat_id
     }
 
+    pub async fn send_message(&self, text: &str) -> Result<(), teloxide::RequestError> {
+        self.bot.send_message(self.chat_id, text).await?;
+        Ok(())
+    }
+
     pub async fn send_photo(
         &self,
         jpeg: Vec<u8>,
