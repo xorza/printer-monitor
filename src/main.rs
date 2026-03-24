@@ -230,7 +230,13 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
             if was_printing {
                 let msg = format!("Print stopped — printer is now {current:?}");
                 info!("{msg}");
-                state.tg.send_message(&msg).await?;
+                match state.camera.capture().await {
+                    Ok(jpeg) => state.tg.send_photo(jpeg, &msg, &[]).await?,
+                    Err(e) => {
+                        error!("Failed to capture snapshot for status change: {e}");
+                        state.tg.send_message(&msg).await?;
+                    }
+                }
             }
             return Ok(());
         }
