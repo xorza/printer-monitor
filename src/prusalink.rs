@@ -43,6 +43,11 @@ pub struct JobStatus {
     pub time_printing: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct StealthResponse {
+    pub enabled: bool,
+}
+
 impl PrusaLink {
     pub fn new(client: Client, base_url: String, api_key: String) -> Self {
         Self {
@@ -87,6 +92,24 @@ impl PrusaLink {
 
     pub async fn resume(&self, job_id: u64) -> Result<(), reqwest::Error> {
         self.put(&format!("/api/v1/job/{job_id}/resume"))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    pub async fn stealth(&self) -> Result<StealthResponse, reqwest::Error> {
+        self.get("/api/v1/settings/stealth")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+    }
+
+    pub async fn set_stealth(&self, enable: bool) -> Result<(), reqwest::Error> {
+        let state = if enable { "on" } else { "off" };
+        self.put(&format!("/api/v1/settings/stealth/{state}"))
             .send()
             .await?
             .error_for_status()?;
@@ -162,5 +185,19 @@ mod tests {
         let json = r#"{"printer": {"state": "CALIBRATING"}}"#;
         let status: StatusResponse = serde_json::from_str(json).unwrap();
         assert_eq!(status.printer.state, PrinterState::Unknown);
+    }
+
+    #[test]
+    fn deserialize_stealth_enabled() {
+        let json = r#"{"enabled": true}"#;
+        let resp: StealthResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.enabled);
+    }
+
+    #[test]
+    fn deserialize_stealth_disabled() {
+        let json = r#"{"enabled": false}"#;
+        let resp: StealthResponse = serde_json::from_str(json).unwrap();
+        assert!(!resp.enabled);
     }
 }

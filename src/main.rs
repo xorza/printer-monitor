@@ -14,7 +14,7 @@ use prusalink::{JobStatus, PrinterState, PrusaLink};
 use server::ImageServer;
 use teloxide::dispatching::{DefaultKey, HandlerExt, ShutdownToken};
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, InlineKeyboardButton};
+use teloxide::types::{ChatAction, InlineKeyboardButton, InlineKeyboardMarkup};
 use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -57,6 +57,8 @@ enum Command {
     Resume,
     /// Take a snapshot and send it
     Status,
+    /// Toggle stealth mode: /stealth [on|off|1|0|true|false]
+    Stealth(String),
 }
 
 type SharedShutdownToken = Arc<Mutex<Option<ShutdownToken>>>;
@@ -344,6 +346,23 @@ async fn handle_command(
                 }
             }
         }
+        Command::Stealth(arg) => {
+            bot.send_chat_action(chat, ChatAction::Typing).await?;
+            let enable = match arg.trim().to_lowercase().as_str() {
+                "on" | "1" | "true" => Some(true),
+                "off" | "0" | "false" => Some(false),
+                "" => None,
+                _ => {
+                    bot.send_message(chat, "Usage: /stealth [on|off|1|0|true|false]")
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let reply = handle_stealth(&state, enable, &bot, chat).await;
+            if let Err(e) = reply {
+                bot.send_message(chat, format!("Error: {e}")).await?;
+            }
+        }
     }
     Ok(())
 }
@@ -354,18 +373,35 @@ async fn handle_callback(
     state: AppState,
 ) -> Result<(), teloxide::RequestError> {
     let data = q.data.as_deref().unwrap_or("");
-    let pause = match data {
-        "pause" => true,
-        "resume" => false,
+
+    let reply = match data {
+        "pause" | "resume" => {
+            let pause = data == "pause";
+            match &state.prusa {
+                Some(prusa) => handle_pause_resume(prusa, pause).await,
+                None => "PrusaLink not configured.".to_string(),
+            }
+        }
+        "stealth on" | "stealth off" => {
+            let enable = data == "stealth on";
+            match &state.prusa {
+                Some(prusa) => match prusa.set_stealth(enable).await {
+                    Ok(()) => format!(
+                        "Stealth mode {}.",
+                        if enable { "enabled" } else { "disabled" }
+                    ),
+                    Err(e) => {
+                        error!("Stealth set error: {e}");
+                        format!("Failed to set stealth: {e}")
+                    }
+                },
+                None => "PrusaLink not configured.".to_string(),
+            }
+        }
         _ => {
             bot.answer_callback_query(q.id).await?;
             return Ok(());
         }
-    };
-
-    let reply = match &state.prusa {
-        Some(prusa) => handle_pause_resume(prusa, pause).await,
-        None => "PrusaLink not configured.".to_string(),
     };
 
     if let Some(msg) = &q.message {
@@ -403,6 +439,52 @@ async fn handle_pause_resume(prusa: &PrusaLink, pause: bool) -> String {
             format!("Failed to {action}: {e}")
         }
     }
+}
+
+async fn handle_stealth(
+    state: &AppState,
+    enable: Option<bool>,
+    bot: &Bot,
+    chat: ChatId,
+) -> Result<(), teloxide::RequestError> {
+    let Some(prusa) = &state.prusa else {
+        bot.send_message(chat, "PrusaLink not configured.").await?;
+        return Ok(());
+    };
+
+    if let Some(enable) = enable {
+        match prusa.set_stealth(enable).await {
+            Ok(()) => {
+                let label = if enable { "enabled" } else { "disabled" };
+                bot.send_message(chat, format!("Stealth mode {label}."))
+                    .await?;
+            }
+            Err(e) => {
+                error!("Stealth set error: {e}");
+                bot.send_message(chat, format!("Failed to set stealth: {e}"))
+                    .await?;
+            }
+        }
+    } else {
+        match prusa.stealth().await {
+            Ok(resp) => {
+                let status = if resp.enabled { "ON" } else { "OFF" };
+                let buttons = InlineKeyboardMarkup::new(vec![vec![
+                    InlineKeyboardButton::callback("On", "stealth on"),
+                    InlineKeyboardButton::callback("Off", "stealth off"),
+                ]]);
+                bot.send_message(chat, format!("Stealth mode is {status}."))
+                    .reply_markup(buttons)
+                    .await?;
+            }
+            Err(e) => {
+                error!("Stealth get error: {e}");
+                bot.send_message(chat, format!("Failed to get stealth state: {e}"))
+                    .await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn status_caption(state: &AppState) -> String {
