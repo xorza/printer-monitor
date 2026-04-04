@@ -238,11 +238,13 @@ fn build_dispatcher(state: &AppState) -> Dispatcher<Bot, teloxide::RequestError,
 }
 
 async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
-    let Some(status) = poll_printer(state).await? else {
-        return Ok(());
-    };
+    let status = poll_printer(state).await?;
 
-    let job = status.job.as_ref();
+    if !state.monitor.lock().await.monitoring_enabled {
+        return Ok(());
+    }
+
+    let job = status.as_ref().and_then(|s| s.job.as_ref());
     if let Some(job) = job {
         info!(job_id = job.id, "{}", format_job_info(job));
     }
@@ -261,8 +263,8 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
     send_alert(state, jpeg, score, paused, job).await
 }
 
-/// Poll printer, update state, handle non-printing transitions.
-/// Returns `Some(status)` if printing and monitoring is enabled.
+/// Poll printer and update state. Handles non-printing transitions
+/// (reset detection, notify on stop). Returns `None` if not printing.
 async fn poll_printer(state: &AppState) -> Result<Option<StatusResponse>, MonitorError> {
     let Some(prusa) = &state.prusa else {
         return Ok(None);
@@ -283,10 +285,6 @@ async fn poll_printer(state: &AppState) -> Result<Option<StatusResponse>, Monito
         if was_printing {
             notify_print_stopped(state, current).await?;
         }
-        return Ok(None);
-    }
-
-    if !mon.monitoring_enabled {
         return Ok(None);
     }
 
@@ -338,7 +336,7 @@ async fn process_detection(
     if alert == AlertLevel::Warning {
         error!(score, "Detection: warning");
     } else {
-        error!(score, "Detection: failing — attempting pause");
+        error!(score, "Detection: failing");
     }
     mon.alert_level = alert;
     Some((alert, score, mon.auto_pause))
@@ -433,9 +431,7 @@ async fn handle_command(
                 return Ok(());
             };
             bot.send_chat_action(chat, ChatAction::Typing).await?;
-            if let Err(e) = handle_stealth(&state, enable, &bot, chat).await {
-                bot.send_message(chat, format!("Error: {e}")).await?;
-            }
+            handle_stealth(&state, enable, &bot, chat).await?;
         }
         Command::Monitor(arg) => {
             let Some(enable) = parse_toggle(&arg) else {
@@ -606,7 +602,11 @@ async fn set_toggle(
     label: &str,
     field: fn(&mut MonitorState) -> &mut bool,
 ) -> String {
-    *field(&mut *state.monitor.lock().await) = enable;
+    let mut mon = state.monitor.lock().await;
+    *field(&mut mon) = enable;
+    if mon.monitoring_enabled {
+        mon.alert_level = AlertLevel::Safe;
+    }
     let action = if enable { "enabled" } else { "disabled" };
     format!("{label} {action}.")
 }
