@@ -1,0 +1,6 @@
+pause - Pause the current print
+resume - Resume the paused print
+status - Take a snapshot and send it
+stealth - Toggle stealth mode (on/off)
+monitor - Toggle failure monitoring (on/off)
+autopause - Toggle auto-pause on failure (on/off)
