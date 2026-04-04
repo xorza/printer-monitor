@@ -4,6 +4,7 @@ pub mod obico;
 pub mod prusalink;
 pub mod rtsp_capture;
 pub mod server;
+pub mod settings;
 pub mod telegram;
 
 use std::sync::Arc;
@@ -137,12 +138,15 @@ async fn run() {
         )),
         camera: Arc::new(rtsp_capture::RtspCapture::new(&config.rtsp_url)),
         image_server: Arc::new(image_server),
-        monitor: Arc::new(Mutex::new(MonitorState {
-            detection: DetectionState::new(config.detection_sensitivity),
-            printer_state: PrinterState::Idle,
-            alert_level: AlertLevel::Safe,
-            monitoring_enabled: true,
-            auto_pause: true,
+        monitor: Arc::new(Mutex::new({
+            let s = settings::Settings::load();
+            MonitorState {
+                detection: DetectionState::new(config.detection_sensitivity),
+                printer_state: PrinterState::Idle,
+                alert_level: AlertLevel::Safe,
+                monitoring_enabled: s.monitoring_enabled,
+                auto_pause: s.auto_pause,
+            }
         })),
     };
 
@@ -607,8 +611,17 @@ async fn set_toggle(
     if mon.monitoring_enabled {
         mon.alert_level = AlertLevel::Safe;
     }
+    save_settings(&mon);
     let action = if enable { "enabled" } else { "disabled" };
     format!("{label} {action}.")
+}
+
+fn save_settings(mon: &MonitorState) {
+    let s = settings::Settings {
+        monitoring_enabled: mon.monitoring_enabled,
+        auto_pause: mon.auto_pause,
+    };
+    s.save();
 }
 
 async fn handle_toggle(
