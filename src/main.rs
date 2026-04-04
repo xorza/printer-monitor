@@ -49,6 +49,7 @@ struct MonitorState {
     detection: DetectionState,
     printer_state: PrinterState,
     alert_level: AlertLevel,
+    monitoring_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +73,8 @@ enum Command {
     Status,
     /// Toggle stealth mode: /stealth [on|off|1|0|true|false]
     Stealth(String),
+    /// Toggle failure monitoring: /monitor [on|off|1|0|true|false]
+    Monitor(String),
 }
 
 type SharedShutdownToken = Arc<Mutex<Option<ShutdownToken>>>;
@@ -130,6 +133,7 @@ async fn run() {
             detection: DetectionState::new(config.detection_sensitivity),
             printer_state: PrinterState::Idle,
             alert_level: AlertLevel::Safe,
+            monitoring_enabled: true,
         })),
     };
 
@@ -262,6 +266,10 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
         None
     };
 
+    if !state.monitor.lock().await.monitoring_enabled {
+        return Ok(());
+    }
+
     let job = status.as_ref().and_then(|s| s.job.as_ref());
     if let Some(job) = job {
         info!(job_id = job.id, "{}", format_job_info(job));
@@ -392,6 +400,19 @@ async fn handle_command(
                 bot.send_message(chat, format!("Error: {e}")).await?;
             }
         }
+        Command::Monitor(arg) => {
+            let enable = match arg.trim().to_lowercase().as_str() {
+                "on" | "1" | "true" => Some(true),
+                "off" | "0" | "false" => Some(false),
+                "" => None,
+                _ => {
+                    bot.send_message(chat, "Usage: /monitor [on|off|1|0|true|false]")
+                        .await?;
+                    return Ok(());
+                }
+            };
+            handle_monitor(&state, enable, &bot, chat).await?;
+        }
     }
     Ok(())
 }
@@ -417,6 +438,10 @@ async fn handle_callback(
                 Some(prusa) => set_stealth_message(prusa, enable).await,
                 None => "PrusaLink not configured.".to_string(),
             }
+        }
+        "monitor on" | "monitor off" => {
+            let enable = data == "monitor on";
+            set_monitoring(&state, enable).await
         }
         _ => {
             bot.answer_callback_query(q.id).await?;
@@ -506,6 +531,35 @@ async fn handle_stealth(
                     .await?;
             }
         }
+    }
+    Ok(())
+}
+
+async fn set_monitoring(state: &AppState, enable: bool) -> String {
+    state.monitor.lock().await.monitoring_enabled = enable;
+    let label = if enable { "enabled" } else { "disabled" };
+    format!("Failure monitoring {label}.")
+}
+
+async fn handle_monitor(
+    state: &AppState,
+    enable: Option<bool>,
+    bot: &Bot,
+    chat: ChatId,
+) -> Result<(), teloxide::RequestError> {
+    if let Some(enable) = enable {
+        let msg = set_monitoring(state, enable).await;
+        bot.send_message(chat, msg).await?;
+    } else {
+        let enabled = state.monitor.lock().await.monitoring_enabled;
+        let status = if enabled { "ON" } else { "OFF" };
+        let buttons = InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback("On", "monitor on"),
+            InlineKeyboardButton::callback("Off", "monitor off"),
+        ]]);
+        bot.send_message(chat, format!("Failure monitoring is {status}."))
+            .reply_markup(buttons)
+            .await?;
     }
     Ok(())
 }
