@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use detection::{DetectionResult, DetectionState};
-use prusalink::{JobStatus, PrinterState, PrusaLink};
+use prusalink::{JobStatus, PrinterState, PrusaLink, StatusResponse};
 use server::ImageServer;
 use teloxide::dispatching::{DefaultKey, HandlerExt, ShutdownToken};
 use teloxide::prelude::*;
@@ -19,8 +19,6 @@ use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-
-// --- Types ---
 
 #[derive(Debug, thiserror::Error)]
 enum MonitorError {
@@ -90,8 +88,6 @@ enum Command {
 }
 
 type SharedShutdownToken = Arc<Mutex<Option<ShutdownToken>>>;
-
-// --- Entry point ---
 
 fn main() {
     let _ = dotenvy::dotenv();
@@ -177,8 +173,6 @@ async fn run() {
     info!("Shutdown complete.");
 }
 
-// --- Signal handling ---
-
 fn spawn_signal_handler(token: &CancellationToken) {
     let token = token.clone();
     tokio::spawn(async move {
@@ -192,8 +186,6 @@ fn spawn_signal_handler(token: &CancellationToken) {
         token.cancel();
     });
 }
-
-// --- Telegram dispatcher ---
 
 fn spawn_telegram_dispatcher(state: &AppState, cancel: &CancellationToken) -> SharedShutdownToken {
     let shutdown_token: SharedShutdownToken = Arc::new(Mutex::new(None));
@@ -245,45 +237,12 @@ fn build_dispatcher(state: &AppState) -> Dispatcher<Bot, teloxide::RequestError,
         .build()
 }
 
-// --- Monitor loop ---
-
 async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
-    let status = if let Some(prusa) = &state.prusa {
-        let s = prusa.status().await?;
-        let current = s.printer.state;
-        info!(state = ?current, "Printer status");
-
-        let mut mon = state.monitor.lock().await;
-        let was_printing = mon.printer_state == PrinterState::Printing;
-        mon.printer_state = current;
-
-        if current != PrinterState::Printing {
-            mon.detection.reset_short_term();
-            mon.alert_level = AlertLevel::Safe;
-            drop(mon);
-            if was_printing {
-                let msg = format!("Print stopped — printer is now {current:?}");
-                info!("{msg}");
-                match state.camera.capture().await {
-                    Ok(jpeg) => state.tg.send_photo(jpeg, &msg, &[]).await?,
-                    Err(e) => {
-                        error!("Failed to capture snapshot for status change: {e}");
-                        state.tg.send_message(&msg).await?;
-                    }
-                }
-            }
-            return Ok(());
-        }
-        Some(s)
-    } else {
-        None
+    let Some(status) = poll_printer(state).await? else {
+        return Ok(());
     };
 
-    if !state.monitor.lock().await.monitoring_enabled {
-        return Ok(());
-    }
-
-    let job = status.as_ref().and_then(|s| s.job.as_ref());
+    let job = status.job.as_ref();
     if let Some(job) = job {
         info!(job_id = job.id, "{}", format_job_info(job));
     }
@@ -293,52 +252,126 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
 
     let obico_result = state.obico.detect().await?;
 
-    let (alert, score, auto_pause) = {
-        let mut mon = state.monitor.lock().await;
-        let result = mon
-            .detection
-            .update(&obico_result.detections, job.map(|j| j.id));
-        match result {
-            DetectionResult::Safe => {
-                info!("Detection: safe");
-                mon.alert_level = AlertLevel::Safe;
-                return Ok(());
-            }
-            DetectionResult::Warning { score } => {
-                if AlertLevel::Warning <= mon.alert_level {
-                    return Ok(());
-                }
-                error!(score, "Detection: warning");
-                mon.alert_level = AlertLevel::Warning;
-                (AlertLevel::Warning, score, mon.auto_pause)
-            }
-            DetectionResult::Failing { score } => {
-                if AlertLevel::Failing <= mon.alert_level {
-                    return Ok(());
-                }
-                error!(score, "Detection: failing — attempting pause");
-                mon.alert_level = AlertLevel::Failing;
-                (AlertLevel::Failing, score, mon.auto_pause)
-            }
-        }
+    let Some((alert, score, auto_pause)) = process_detection(state, &obico_result, job).await
+    else {
+        return Ok(());
     };
 
-    let paused = if alert == AlertLevel::Failing && auto_pause {
-        if let Some((prusa, job)) = state.prusa.as_ref().zip(job) {
-            match prusa.pause(job.id).await {
-                Ok(()) => true,
-                Err(e) => {
-                    error!("Failed to pause print: {e}");
-                    false
-                }
-            }
-        } else {
+    let paused = try_pause(state, alert, auto_pause, job).await;
+    send_alert(state, jpeg, score, paused, job).await
+}
+
+/// Poll printer, update state, handle non-printing transitions.
+/// Returns `Some(status)` if printing and monitoring is enabled.
+async fn poll_printer(state: &AppState) -> Result<Option<StatusResponse>, MonitorError> {
+    let Some(prusa) = &state.prusa else {
+        return Ok(None);
+    };
+
+    let status = prusa.status().await?;
+    let current = status.printer.state;
+    info!(state = ?current, "Printer status");
+
+    let mut mon = state.monitor.lock().await;
+    let was_printing = mon.printer_state == PrinterState::Printing;
+    mon.printer_state = current;
+
+    if current != PrinterState::Printing {
+        mon.detection.reset_short_term();
+        mon.alert_level = AlertLevel::Safe;
+        drop(mon);
+        if was_printing {
+            notify_print_stopped(state, current).await?;
+        }
+        return Ok(None);
+    }
+
+    if !mon.monitoring_enabled {
+        return Ok(None);
+    }
+
+    Ok(Some(status))
+}
+
+async fn notify_print_stopped(
+    state: &AppState,
+    printer_state: PrinterState,
+) -> Result<(), MonitorError> {
+    let msg = format!("Print stopped — printer is now {printer_state:?}");
+    info!("{msg}");
+    match state.camera.capture().await {
+        Ok(jpeg) => state.tg.send_photo(jpeg, &msg, &[]).await?,
+        Err(e) => {
+            error!("Failed to capture snapshot for status change: {e}");
+            state.tg.send_message(&msg).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Run detection update and check alert escalation.
+/// Returns `None` if safe or no escalation (already notified at this level).
+async fn process_detection(
+    state: &AppState,
+    obico_result: &obico::DetectionResponse,
+    job: Option<&JobStatus>,
+) -> Option<(AlertLevel, f64, bool)> {
+    let mut mon = state.monitor.lock().await;
+    let result = mon
+        .detection
+        .update(&obico_result.detections, job.map(|j| j.id));
+
+    let (alert, score) = match result {
+        DetectionResult::Safe => {
+            info!("Detection: safe");
+            mon.alert_level = AlertLevel::Safe;
+            return None;
+        }
+        DetectionResult::Warning { score } => (AlertLevel::Warning, score),
+        DetectionResult::Failing { score } => (AlertLevel::Failing, score),
+    };
+
+    if alert <= mon.alert_level {
+        return None;
+    }
+
+    if alert == AlertLevel::Warning {
+        error!(score, "Detection: warning");
+    } else {
+        error!(score, "Detection: failing — attempting pause");
+    }
+    mon.alert_level = alert;
+    Some((alert, score, mon.auto_pause))
+}
+
+async fn try_pause(
+    state: &AppState,
+    alert: AlertLevel,
+    auto_pause: bool,
+    job: Option<&JobStatus>,
+) -> bool {
+    if alert != AlertLevel::Failing || !auto_pause {
+        return false;
+    }
+    let Some((prusa, job)) = state.prusa.as_ref().zip(job) else {
+        return false;
+    };
+    match prusa.pause(job.id).await {
+        Ok(()) => true,
+        Err(e) => {
+            error!("Failed to pause print: {e}");
             false
         }
-    } else {
-        false
-    };
+    }
+}
 
+async fn send_alert(
+    state: &AppState,
+    jpeg: Vec<u8>,
+    score: f64,
+    paused: bool,
+    job: Option<&JobStatus>,
+) -> Result<(), MonitorError> {
     let action = if paused {
         "Print has been paused."
     } else {
@@ -355,11 +388,8 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
         (false, false) => vec![],
     };
     state.tg.send_photo(jpeg, &caption, &buttons).await?;
-
     Ok(())
 }
-
-// --- Bot commands ---
 
 async fn handle_command(
     bot: Bot,
@@ -632,8 +662,6 @@ async fn status_caption(state: &AppState) -> String {
         }
     }
 }
-
-// --- Helpers ---
 
 fn format_job_info(job: &JobStatus) -> String {
     format!(
