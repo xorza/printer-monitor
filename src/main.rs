@@ -37,6 +37,15 @@ enum MonitorError {
 const POLL_TARGET: Duration = Duration::from_secs(10);
 const POLL_MIN_SLEEP: Duration = Duration::from_secs(1);
 
+fn parse_toggle(arg: &str) -> Option<Option<bool>> {
+    match arg.trim().to_lowercase().as_str() {
+        "on" | "1" | "true" => Some(Some(true)),
+        "off" | "0" | "false" => Some(Some(false)),
+        "" => Some(None),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum AlertLevel {
     Safe,
@@ -50,6 +59,7 @@ struct MonitorState {
     printer_state: PrinterState,
     alert_level: AlertLevel,
     monitoring_enabled: bool,
+    auto_pause: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +85,8 @@ enum Command {
     Stealth(String),
     /// Toggle failure monitoring: /monitor [on|off|1|0|true|false]
     Monitor(String),
+    /// Toggle auto-pause on failure: /autopause [on|off|1|0|true|false]
+    Autopause(String),
 }
 
 type SharedShutdownToken = Arc<Mutex<Option<ShutdownToken>>>;
@@ -134,6 +146,7 @@ async fn run() {
             printer_state: PrinterState::Idle,
             alert_level: AlertLevel::Safe,
             monitoring_enabled: true,
+            auto_pause: true,
         })),
     };
 
@@ -280,7 +293,7 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
 
     let obico_result = state.obico.detect().await?;
 
-    let (alert, score) = {
+    let (alert, score, auto_pause) = {
         let mut mon = state.monitor.lock().await;
         let result = mon
             .detection
@@ -297,7 +310,7 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
                 }
                 error!(score, "Detection: warning");
                 mon.alert_level = AlertLevel::Warning;
-                (AlertLevel::Warning, score)
+                (AlertLevel::Warning, score, mon.auto_pause)
             }
             DetectionResult::Failing { score } => {
                 if AlertLevel::Failing <= mon.alert_level {
@@ -305,12 +318,12 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
                 }
                 error!(score, "Detection: failing — attempting pause");
                 mon.alert_level = AlertLevel::Failing;
-                (AlertLevel::Failing, score)
+                (AlertLevel::Failing, score, mon.auto_pause)
             }
         }
     };
 
-    let paused = if alert == AlertLevel::Failing {
+    let paused = if alert == AlertLevel::Failing && auto_pause {
         if let Some((prusa, job)) = state.prusa.as_ref().zip(job) {
             match prusa.pause(job.id).await {
                 Ok(()) => true,
@@ -384,34 +397,49 @@ async fn handle_command(
             }
         }
         Command::Stealth(arg) => {
-            bot.send_chat_action(chat, ChatAction::Typing).await?;
-            let enable = match arg.trim().to_lowercase().as_str() {
-                "on" | "1" | "true" => Some(true),
-                "off" | "0" | "false" => Some(false),
-                "" => None,
-                _ => {
-                    bot.send_message(chat, "Usage: /stealth [on|off|1|0|true|false]")
-                        .await?;
-                    return Ok(());
-                }
+            let Some(enable) = parse_toggle(&arg) else {
+                bot.send_message(chat, "Usage: /stealth [on|off|1|0|true|false]")
+                    .await?;
+                return Ok(());
             };
-            let reply = handle_stealth(&state, enable, &bot, chat).await;
-            if let Err(e) = reply {
+            bot.send_chat_action(chat, ChatAction::Typing).await?;
+            if let Err(e) = handle_stealth(&state, enable, &bot, chat).await {
                 bot.send_message(chat, format!("Error: {e}")).await?;
             }
         }
         Command::Monitor(arg) => {
-            let enable = match arg.trim().to_lowercase().as_str() {
-                "on" | "1" | "true" => Some(true),
-                "off" | "0" | "false" => Some(false),
-                "" => None,
-                _ => {
-                    bot.send_message(chat, "Usage: /monitor [on|off|1|0|true|false]")
-                        .await?;
-                    return Ok(());
-                }
+            let Some(enable) = parse_toggle(&arg) else {
+                bot.send_message(chat, "Usage: /monitor [on|off|1|0|true|false]")
+                    .await?;
+                return Ok(());
             };
-            handle_monitor(&state, enable, &bot, chat).await?;
+            handle_toggle(
+                &state,
+                enable,
+                "Failure monitoring",
+                "monitor",
+                |m| &mut m.monitoring_enabled,
+                &bot,
+                chat,
+            )
+            .await?;
+        }
+        Command::Autopause(arg) => {
+            let Some(enable) = parse_toggle(&arg) else {
+                bot.send_message(chat, "Usage: /autopause [on|off|1|0|true|false]")
+                    .await?;
+                return Ok(());
+            };
+            handle_toggle(
+                &state,
+                enable,
+                "Auto-pause",
+                "autopause",
+                |m| &mut m.auto_pause,
+                &bot,
+                chat,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -441,7 +469,14 @@ async fn handle_callback(
         }
         "monitor on" | "monitor off" => {
             let enable = data == "monitor on";
-            set_monitoring(&state, enable).await
+            set_toggle(&state, enable, "Failure monitoring", |m| {
+                &mut m.monitoring_enabled
+            })
+            .await
+        }
+        "autopause on" | "autopause off" => {
+            let enable = data == "autopause on";
+            set_toggle(&state, enable, "Auto-pause", |m| &mut m.auto_pause).await
         }
         _ => {
             bot.answer_callback_query(q.id).await?;
@@ -535,29 +570,37 @@ async fn handle_stealth(
     Ok(())
 }
 
-async fn set_monitoring(state: &AppState, enable: bool) -> String {
-    state.monitor.lock().await.monitoring_enabled = enable;
-    let label = if enable { "enabled" } else { "disabled" };
-    format!("Failure monitoring {label}.")
+async fn set_toggle(
+    state: &AppState,
+    enable: bool,
+    label: &str,
+    field: fn(&mut MonitorState) -> &mut bool,
+) -> String {
+    *field(&mut *state.monitor.lock().await) = enable;
+    let action = if enable { "enabled" } else { "disabled" };
+    format!("{label} {action}.")
 }
 
-async fn handle_monitor(
+async fn handle_toggle(
     state: &AppState,
     enable: Option<bool>,
+    label: &str,
+    callback_prefix: &str,
+    field: fn(&mut MonitorState) -> &mut bool,
     bot: &Bot,
     chat: ChatId,
 ) -> Result<(), teloxide::RequestError> {
     if let Some(enable) = enable {
-        let msg = set_monitoring(state, enable).await;
+        let msg = set_toggle(state, enable, label, field).await;
         bot.send_message(chat, msg).await?;
     } else {
-        let enabled = state.monitor.lock().await.monitoring_enabled;
+        let enabled = *field(&mut *state.monitor.lock().await);
         let status = if enabled { "ON" } else { "OFF" };
         let buttons = InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::callback("On", "monitor on"),
-            InlineKeyboardButton::callback("Off", "monitor off"),
+            InlineKeyboardButton::callback("On", format!("{callback_prefix} on")),
+            InlineKeyboardButton::callback("Off", format!("{callback_prefix} off")),
         ]]);
-        bot.send_message(chat, format!("Failure monitoring is {status}."))
+        bot.send_message(chat, format!("{label} is {status}."))
             .reply_markup(buttons)
             .await?;
     }
