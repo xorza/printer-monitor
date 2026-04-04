@@ -61,6 +61,16 @@ struct MonitorState {
     auto_pause: bool,
 }
 
+impl MonitorState {
+    fn save_settings(&self) {
+        settings::Settings {
+            monitoring_enabled: self.monitoring_enabled,
+            auto_pause: self.auto_pause,
+        }
+        .save();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AppState {
     prusa: Option<Arc<PrusaLink>>,
@@ -311,21 +321,14 @@ async fn notify_print_stopped(
     Ok(())
 }
 
-/// Run detection update and check alert escalation.
+/// Check alert escalation against current level.
 /// Returns `None` if safe or no escalation (already notified at this level).
-async fn process_detection(
-    state: &AppState,
-    obico_result: &obico::DetectionResponse,
-    job: Option<&JobStatus>,
+fn check_escalation(
+    mon: &mut MonitorState,
+    result: DetectionResult,
 ) -> Option<(AlertLevel, f64, bool)> {
-    let mut mon = state.monitor.lock().await;
-    let result = mon
-        .detection
-        .update(&obico_result.detections, job.map(|j| j.id));
-
     let (alert, score) = match result {
         DetectionResult::Safe => {
-            info!("Detection: safe");
             mon.alert_level = AlertLevel::Safe;
             return None;
         }
@@ -337,13 +340,31 @@ async fn process_detection(
         return None;
     }
 
-    if alert == AlertLevel::Warning {
-        error!(score, "Detection: warning");
-    } else {
-        error!(score, "Detection: failing");
-    }
     mon.alert_level = alert;
     Some((alert, score, mon.auto_pause))
+}
+
+async fn process_detection(
+    state: &AppState,
+    obico_result: &obico::DetectionResponse,
+    job: Option<&JobStatus>,
+) -> Option<(AlertLevel, f64, bool)> {
+    let mut mon = state.monitor.lock().await;
+    let result = mon
+        .detection
+        .update(&obico_result.detections, job.map(|j| j.id));
+    let escalation = check_escalation(&mut mon, result);
+
+    match &escalation {
+        Some((level, score, _)) => error!(?level, score, "Detection alert escalated"),
+        None => info!("Detection: no escalation"),
+    }
+
+    escalation
+}
+
+fn should_pause(alert: AlertLevel, auto_pause: bool) -> bool {
+    alert == AlertLevel::Failing && auto_pause
 }
 
 async fn try_pause(
@@ -352,7 +373,7 @@ async fn try_pause(
     auto_pause: bool,
     job: Option<&JobStatus>,
 ) -> bool {
-    if alert != AlertLevel::Failing || !auto_pause {
+    if !should_pause(alert, auto_pause) {
         return false;
     }
     let Some((prusa, job)) = state.prusa.as_ref().zip(job) else {
@@ -367,13 +388,7 @@ async fn try_pause(
     }
 }
 
-async fn send_alert(
-    state: &AppState,
-    jpeg: Vec<u8>,
-    score: f64,
-    paused: bool,
-    job: Option<&JobStatus>,
-) -> Result<(), MonitorError> {
+fn build_alert_caption(score: f64, paused: bool, job: Option<&JobStatus>) -> String {
     let action = if paused {
         "Print has been paused."
     } else {
@@ -382,13 +397,26 @@ async fn send_alert(
     let job_line = job
         .map(|j| format!("{}\n", format_job_info(j)))
         .unwrap_or_default();
-    let caption = format!("Print failure detected!\n{job_line}Score: {score:.2}\n{action}");
+    format!("Print failure detected!\n{job_line}Score: {score:.2}\n{action}")
+}
 
-    let buttons = match (paused, state.prusa.is_some()) {
+fn alert_buttons(paused: bool, has_prusa: bool) -> Vec<InlineKeyboardButton> {
+    match (paused, has_prusa) {
         (true, _) => vec![InlineKeyboardButton::callback("Resume", "resume")],
         (false, true) => vec![InlineKeyboardButton::callback("Pause", "pause")],
         (false, false) => vec![],
-    };
+    }
+}
+
+async fn send_alert(
+    state: &AppState,
+    jpeg: Vec<u8>,
+    score: f64,
+    paused: bool,
+    job: Option<&JobStatus>,
+) -> Result<(), MonitorError> {
+    let caption = build_alert_caption(score, paused, job);
+    let buttons = alert_buttons(paused, state.prusa.is_some());
     state.tg.send_photo(jpeg, &caption, &buttons).await?;
     Ok(())
 }
@@ -428,48 +456,49 @@ async fn handle_command(
                 }
             }
         }
-        Command::Stealth(arg) => {
-            let Some(enable) = parse_toggle(&arg) else {
-                bot.send_message(chat, "Usage: /stealth [on|off|1|0|true|false]")
+        Command::Stealth(ref arg) | Command::Monitor(ref arg) | Command::Autopause(ref arg) => {
+            let Some(enable) = parse_toggle(arg) else {
+                let name = match &cmd {
+                    Command::Stealth(_) => "stealth",
+                    Command::Monitor(_) => "monitor",
+                    Command::Autopause(_) => "autopause",
+                    _ => unreachable!(),
+                };
+                bot.send_message(chat, format!("Usage: /{name} [on|off|1|0|true|false]"))
                     .await?;
                 return Ok(());
             };
-            bot.send_chat_action(chat, ChatAction::Typing).await?;
-            handle_stealth(&state, enable, &bot, chat).await?;
-        }
-        Command::Monitor(arg) => {
-            let Some(enable) = parse_toggle(&arg) else {
-                bot.send_message(chat, "Usage: /monitor [on|off|1|0|true|false]")
+            match cmd {
+                Command::Stealth(_) => {
+                    bot.send_chat_action(chat, ChatAction::Typing).await?;
+                    handle_stealth(&state, enable, &bot, chat).await?;
+                }
+                Command::Monitor(_) => {
+                    handle_toggle(
+                        &state,
+                        enable,
+                        "Failure monitoring",
+                        "monitor",
+                        |m| &mut m.monitoring_enabled,
+                        &bot,
+                        chat,
+                    )
                     .await?;
-                return Ok(());
-            };
-            handle_toggle(
-                &state,
-                enable,
-                "Failure monitoring",
-                "monitor",
-                |m| &mut m.monitoring_enabled,
-                &bot,
-                chat,
-            )
-            .await?;
-        }
-        Command::Autopause(arg) => {
-            let Some(enable) = parse_toggle(&arg) else {
-                bot.send_message(chat, "Usage: /autopause [on|off|1|0|true|false]")
+                }
+                Command::Autopause(_) => {
+                    handle_toggle(
+                        &state,
+                        enable,
+                        "Auto-pause",
+                        "autopause",
+                        |m| &mut m.auto_pause,
+                        &bot,
+                        chat,
+                    )
                     .await?;
-                return Ok(());
-            };
-            handle_toggle(
-                &state,
-                enable,
-                "Auto-pause",
-                "autopause",
-                |m| &mut m.auto_pause,
-                &bot,
-                chat,
-            )
-            .await?;
+                }
+                _ => unreachable!(),
+            }
         }
     }
     Ok(())
@@ -611,17 +640,9 @@ async fn set_toggle(
     if mon.monitoring_enabled {
         mon.alert_level = AlertLevel::Safe;
     }
-    save_settings(&mon);
+    mon.save_settings();
     let action = if enable { "enabled" } else { "disabled" };
     format!("{label} {action}.")
-}
-
-fn save_settings(mon: &MonitorState) {
-    let s = settings::Settings {
-        monitoring_enabled: mon.monitoring_enabled,
-        auto_pause: mon.auto_pause,
-    };
-    s.save();
 }
 
 async fn handle_toggle(
@@ -650,28 +671,28 @@ async fn handle_toggle(
     Ok(())
 }
 
+fn format_status_caption(
+    printer_state: PrinterState,
+    job: Option<&JobStatus>,
+    score: f64,
+) -> String {
+    let job_info = job
+        .map(format_job_info)
+        .unwrap_or_else(|| "No active job".to_string());
+    format!("State: {printer_state:?}\n{job_info}\nDetection score: {score:.2}")
+}
+
 async fn status_caption(state: &AppState) -> String {
     let score = state.monitor.lock().await.detection.current_score();
-    let score_line = format!("Detection score: {score:.2}");
 
     let Some(prusa) = state.prusa.as_ref() else {
-        return format!("PrusaLink not configured.\n{score_line}");
+        return format!("PrusaLink not configured.\nDetection score: {score:.2}");
     };
     match prusa.status().await {
-        Ok(status) => {
-            let job_info = status
-                .job
-                .as_ref()
-                .map(format_job_info)
-                .unwrap_or_else(|| "No active job".to_string());
-            format!(
-                "State: {:?}\n{job_info}\n{score_line}",
-                status.printer.state
-            )
-        }
+        Ok(status) => format_status_caption(status.printer.state, status.job.as_ref(), score),
         Err(e) => {
             error!("PrusaLink status error: {e}");
-            format!("PrusaLink error: {e}\n{score_line}")
+            format!("PrusaLink error: {e}\nDetection score: {score:.2}")
         }
     }
 }
@@ -682,4 +703,263 @@ fn format_job_info(job: &JobStatus) -> String {
         job.id,
         job.progress.unwrap_or(0.0)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(id: u64, progress: Option<f64>) -> JobStatus {
+        JobStatus {
+            id,
+            progress,
+            time_remaining: None,
+            time_printing: None,
+        }
+    }
+
+    #[test]
+    fn parse_toggle_on_variants() {
+        assert_eq!(parse_toggle("on"), Some(Some(true)));
+        assert_eq!(parse_toggle("1"), Some(Some(true)));
+        assert_eq!(parse_toggle("true"), Some(Some(true)));
+        assert_eq!(parse_toggle("ON"), Some(Some(true)));
+        assert_eq!(parse_toggle("True"), Some(Some(true)));
+        assert_eq!(parse_toggle("  on  "), Some(Some(true)));
+    }
+
+    #[test]
+    fn parse_toggle_off_variants() {
+        assert_eq!(parse_toggle("off"), Some(Some(false)));
+        assert_eq!(parse_toggle("0"), Some(Some(false)));
+        assert_eq!(parse_toggle("false"), Some(Some(false)));
+        assert_eq!(parse_toggle("OFF"), Some(Some(false)));
+    }
+
+    #[test]
+    fn parse_toggle_empty_returns_none_value() {
+        assert_eq!(parse_toggle(""), Some(None));
+        assert_eq!(parse_toggle("  "), Some(None));
+    }
+
+    #[test]
+    fn parse_toggle_invalid_returns_none() {
+        assert_eq!(parse_toggle("yes"), None);
+        assert_eq!(parse_toggle("no"), None);
+        assert_eq!(parse_toggle("2"), None);
+        assert_eq!(parse_toggle("maybe"), None);
+    }
+
+    #[test]
+    fn format_job_info_with_progress() {
+        let j = job(42, Some(73.456));
+        assert_eq!(format_job_info(&j), "Job #42, progress: 73.5%");
+    }
+
+    #[test]
+    fn format_job_info_no_progress() {
+        let j = job(1, None);
+        assert_eq!(format_job_info(&j), "Job #1, progress: 0.0%");
+    }
+
+    #[test]
+    fn alert_caption_paused_with_job() {
+        let j = job(5, Some(50.0));
+        let caption = build_alert_caption(0.72, true, Some(&j));
+        assert!(caption.contains("Print failure detected!"));
+        assert!(caption.contains("Job #5, progress: 50.0%"));
+        assert!(caption.contains("Score: 0.72"));
+        assert!(caption.contains("Print has been paused."));
+    }
+
+    #[test]
+    fn alert_caption_not_paused_no_job() {
+        let caption = build_alert_caption(0.40, false, None);
+        assert!(caption.contains("Score: 0.40"));
+        assert!(caption.contains("Print is still running"));
+        assert!(!caption.contains("Job #"));
+    }
+
+    #[test]
+    fn alert_buttons_paused() {
+        let buttons = alert_buttons(true, true);
+        assert_eq!(buttons.len(), 1);
+        assert_eq!(buttons[0].text, "Resume");
+    }
+
+    #[test]
+    fn alert_buttons_not_paused_with_prusa() {
+        let buttons = alert_buttons(false, true);
+        assert_eq!(buttons.len(), 1);
+        assert_eq!(buttons[0].text, "Pause");
+    }
+
+    #[test]
+    fn alert_buttons_not_paused_no_prusa() {
+        let buttons = alert_buttons(false, false);
+        assert!(buttons.is_empty());
+    }
+
+    #[test]
+    fn status_caption_formatting() {
+        let j = job(10, Some(25.0));
+        let caption = format_status_caption(PrinterState::Printing, Some(&j), 0.15);
+        assert!(caption.contains("State: Printing"));
+        assert!(caption.contains("Job #10, progress: 25.0%"));
+        assert!(caption.contains("Detection score: 0.15"));
+    }
+
+    #[test]
+    fn status_caption_no_job() {
+        let caption = format_status_caption(PrinterState::Idle, None, 0.0);
+        assert!(caption.contains("State: Idle"));
+        assert!(caption.contains("No active job"));
+        assert!(caption.contains("Detection score: 0.00"));
+    }
+
+    #[test]
+    fn alert_level_ordering() {
+        assert!(AlertLevel::Safe < AlertLevel::Warning);
+        assert!(AlertLevel::Warning < AlertLevel::Failing);
+        assert!(AlertLevel::Safe < AlertLevel::Failing);
+    }
+
+    #[test]
+    fn alert_level_no_escalation_when_equal() {
+        assert!(AlertLevel::Warning <= AlertLevel::Warning);
+        assert!(AlertLevel::Failing <= AlertLevel::Failing);
+    }
+
+    fn mon(monitoring_enabled: bool, auto_pause: bool) -> MonitorState {
+        MonitorState {
+            detection: DetectionState::new(1.0),
+            printer_state: PrinterState::Idle,
+            alert_level: AlertLevel::Safe,
+            monitoring_enabled,
+            auto_pause,
+        }
+    }
+
+    #[test]
+    fn escalation_safe_resets_alert_level() {
+        let mut m = mon(true, true);
+        m.alert_level = AlertLevel::Warning;
+        let result = check_escalation(&mut m, DetectionResult::Safe);
+        assert!(result.is_none());
+        assert_eq!(m.alert_level, AlertLevel::Safe);
+    }
+
+    #[test]
+    fn escalation_safe_to_warning() {
+        let mut m = mon(true, true);
+        let result = check_escalation(&mut m, DetectionResult::Warning { score: 0.4 });
+        assert!(result.is_some());
+        let (alert, score, _) = result.unwrap();
+        assert_eq!(alert, AlertLevel::Warning);
+        assert_eq!(score, 0.4);
+        assert_eq!(m.alert_level, AlertLevel::Warning);
+    }
+
+    #[test]
+    fn escalation_warning_to_failing() {
+        let mut m = mon(true, true);
+        m.alert_level = AlertLevel::Warning;
+        let result = check_escalation(&mut m, DetectionResult::Failing { score: 0.7 });
+        assert!(result.is_some());
+        let (alert, _, _) = result.unwrap();
+        assert_eq!(alert, AlertLevel::Failing);
+        assert_eq!(m.alert_level, AlertLevel::Failing);
+    }
+
+    #[test]
+    fn escalation_suppressed_at_same_level() {
+        let mut m = mon(true, true);
+        m.alert_level = AlertLevel::Warning;
+        let result = check_escalation(&mut m, DetectionResult::Warning { score: 0.5 });
+        assert!(result.is_none());
+        // alert_level unchanged
+        assert_eq!(m.alert_level, AlertLevel::Warning);
+    }
+
+    #[test]
+    fn escalation_suppressed_at_higher_level() {
+        let mut m = mon(true, true);
+        m.alert_level = AlertLevel::Failing;
+        let result = check_escalation(&mut m, DetectionResult::Warning { score: 0.4 });
+        assert!(result.is_none());
+        // stays at Failing, not downgraded
+        assert_eq!(m.alert_level, AlertLevel::Failing);
+    }
+
+    #[test]
+    fn escalation_returns_auto_pause_setting() {
+        let mut m = mon(true, false);
+        let result = check_escalation(&mut m, DetectionResult::Failing { score: 0.8 });
+        let (_, _, auto_pause) = result.unwrap();
+        assert!(!auto_pause);
+
+        let mut m = mon(true, true);
+        let result = check_escalation(&mut m, DetectionResult::Failing { score: 0.8 });
+        let (_, _, auto_pause) = result.unwrap();
+        assert!(auto_pause);
+    }
+
+    #[test]
+    fn should_pause_only_on_failing_with_auto_pause() {
+        assert!(should_pause(AlertLevel::Failing, true));
+        assert!(!should_pause(AlertLevel::Failing, false));
+        assert!(!should_pause(AlertLevel::Warning, true));
+        assert!(!should_pause(AlertLevel::Warning, false));
+        assert!(!should_pause(AlertLevel::Safe, true));
+    }
+
+    #[test]
+    fn full_flow_safe_to_warning_to_failing() {
+        let mut m = mon(true, true);
+
+        // First: safe
+        let result = check_escalation(&mut m, DetectionResult::Safe);
+        assert!(result.is_none());
+        assert_eq!(m.alert_level, AlertLevel::Safe);
+
+        // Escalate to warning
+        let result = check_escalation(&mut m, DetectionResult::Warning { score: 0.4 });
+        assert!(result.is_some());
+        assert_eq!(m.alert_level, AlertLevel::Warning);
+
+        // Repeated warning suppressed
+        let result = check_escalation(&mut m, DetectionResult::Warning { score: 0.45 });
+        assert!(result.is_none());
+
+        // Escalate to failing
+        let result = check_escalation(&mut m, DetectionResult::Failing { score: 0.7 });
+        assert!(result.is_some());
+        assert_eq!(m.alert_level, AlertLevel::Failing);
+        let (_, _, auto_pause) = result.unwrap();
+        assert!(should_pause(AlertLevel::Failing, auto_pause));
+
+        // Repeated failing suppressed
+        let result = check_escalation(&mut m, DetectionResult::Failing { score: 0.8 });
+        assert!(result.is_none());
+
+        // Back to safe resets
+        let result = check_escalation(&mut m, DetectionResult::Safe);
+        assert!(result.is_none());
+        assert_eq!(m.alert_level, AlertLevel::Safe);
+
+        // Can escalate again after reset
+        let result = check_escalation(&mut m, DetectionResult::Warning { score: 0.35 });
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn full_flow_auto_pause_off_still_alerts_but_no_pause() {
+        let mut m = mon(true, false);
+
+        let result = check_escalation(&mut m, DetectionResult::Failing { score: 0.8 });
+        assert!(result.is_some());
+        let (alert, _, auto_pause) = result.unwrap();
+        assert_eq!(alert, AlertLevel::Failing);
+        assert!(!should_pause(alert, auto_pause));
+    }
 }
