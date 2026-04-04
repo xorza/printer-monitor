@@ -98,12 +98,12 @@ impl DetectionState {
         }
     }
 
-    /// Reset short-term state (EWM, rolling short, frame count).
-    /// Call when printer stops printing so next print starts clean.
     pub fn current_score(&self) -> f64 {
         ((self.ewm_mean - self.rolling_mean_long) * self.sensitivity).max(0.0)
     }
 
+    /// Reset short-term state (EWM, rolling short, frame count).
+    /// Call when printer stops printing so next print starts clean.
     pub fn reset_short_term(&mut self) {
         self.ewm_mean = 0.0;
         self.rolling_mean_short = 0.0;

@@ -37,6 +37,20 @@ enum MonitorError {
 const POLL_TARGET: Duration = Duration::from_secs(10);
 const POLL_MIN_SLEEP: Duration = Duration::from_secs(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AlertLevel {
+    Safe,
+    Warning,
+    Failing,
+}
+
+#[derive(Debug)]
+struct MonitorState {
+    detection: DetectionState,
+    printer_state: PrinterState,
+    alert_level: AlertLevel,
+}
+
 #[derive(Debug, Clone)]
 struct AppState {
     prusa: Option<Arc<PrusaLink>>,
@@ -44,8 +58,7 @@ struct AppState {
     tg: Arc<telegram::Telegram>,
     camera: Arc<rtsp_capture::RtspCapture>,
     image_server: Arc<ImageServer>,
-    detection: Arc<Mutex<DetectionState>>,
-    prev_state: Arc<Mutex<PrinterState>>,
+    monitor: Arc<Mutex<MonitorState>>,
 }
 
 #[derive(BotCommands, Clone, Debug)]
@@ -113,10 +126,11 @@ async fn run() {
         )),
         camera: Arc::new(rtsp_capture::RtspCapture::new(&config.rtsp_url)),
         image_server: Arc::new(image_server),
-        detection: Arc::new(Mutex::new(DetectionState::new(
-            config.detection_sensitivity,
-        ))),
-        prev_state: Arc::new(Mutex::new(PrinterState::Idle)),
+        monitor: Arc::new(Mutex::new(MonitorState {
+            detection: DetectionState::new(config.detection_sensitivity),
+            printer_state: PrinterState::Idle,
+            alert_level: AlertLevel::Safe,
+        })),
     };
 
     spawn_signal_handler(&token);
@@ -222,13 +236,14 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
         let current = s.printer.state;
         info!(state = ?current, "Printer status");
 
-        let mut prev = state.prev_state.lock().await;
-        let was_printing = *prev == PrinterState::Printing;
-        *prev = current;
-        drop(prev);
+        let mut mon = state.monitor.lock().await;
+        let was_printing = mon.printer_state == PrinterState::Printing;
+        mon.printer_state = current;
 
         if current != PrinterState::Printing {
-            state.detection.lock().await.reset_short_term();
+            mon.detection.reset_short_term();
+            mon.alert_level = AlertLevel::Safe;
+            drop(mon);
             if was_printing {
                 let msg = format!("Print stopped — printer is now {current:?}");
                 info!("{msg}");
@@ -257,36 +272,50 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
 
     let obico_result = state.obico.detect().await?;
 
-    let result = state
-        .detection
-        .lock()
-        .await
-        .update(&obico_result.detections, job.map(|j| j.id));
-
-    let (score, paused) = match result {
-        DetectionResult::Safe => {
-            info!("Detection: safe");
-            return Ok(());
-        }
-        DetectionResult::Warning { score } => {
-            error!(score, "Detection: warning");
-            (score, false)
-        }
-        DetectionResult::Failing { score } => {
-            error!(score, "Detection: failing — attempting pause");
-            let paused = if let Some((prusa, job)) = state.prusa.as_ref().zip(job) {
-                match prusa.pause(job.id).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        error!("Failed to pause print: {e}");
-                        false
-                    }
+    let (alert, score) = {
+        let mut mon = state.monitor.lock().await;
+        let result = mon
+            .detection
+            .update(&obico_result.detections, job.map(|j| j.id));
+        match result {
+            DetectionResult::Safe => {
+                info!("Detection: safe");
+                mon.alert_level = AlertLevel::Safe;
+                return Ok(());
+            }
+            DetectionResult::Warning { score } => {
+                if AlertLevel::Warning <= mon.alert_level {
+                    return Ok(());
                 }
-            } else {
-                false
-            };
-            (score, paused)
+                error!(score, "Detection: warning");
+                mon.alert_level = AlertLevel::Warning;
+                (AlertLevel::Warning, score)
+            }
+            DetectionResult::Failing { score } => {
+                if AlertLevel::Failing <= mon.alert_level {
+                    return Ok(());
+                }
+                error!(score, "Detection: failing — attempting pause");
+                mon.alert_level = AlertLevel::Failing;
+                (AlertLevel::Failing, score)
+            }
         }
+    };
+
+    let paused = if alert == AlertLevel::Failing {
+        if let Some((prusa, job)) = state.prusa.as_ref().zip(job) {
+            match prusa.pause(job.id).await {
+                Ok(()) => true,
+                Err(e) => {
+                    error!("Failed to pause print: {e}");
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    } else {
+        false
     };
 
     let action = if paused {
@@ -385,16 +414,7 @@ async fn handle_callback(
         "stealth on" | "stealth off" => {
             let enable = data == "stealth on";
             match &state.prusa {
-                Some(prusa) => match prusa.set_stealth(enable).await {
-                    Ok(()) => format!(
-                        "Stealth mode {}.",
-                        if enable { "enabled" } else { "disabled" }
-                    ),
-                    Err(e) => {
-                        error!("Stealth set error: {e}");
-                        format!("Failed to set stealth: {e}")
-                    }
-                },
+                Some(prusa) => set_stealth_message(prusa, enable).await,
                 None => "PrusaLink not configured.".to_string(),
             }
         }
@@ -441,6 +461,19 @@ async fn handle_pause_resume(prusa: &PrusaLink, pause: bool) -> String {
     }
 }
 
+async fn set_stealth_message(prusa: &PrusaLink, enable: bool) -> String {
+    match prusa.set_stealth(enable).await {
+        Ok(()) => {
+            let label = if enable { "enabled" } else { "disabled" };
+            format!("Stealth mode {label}.")
+        }
+        Err(e) => {
+            error!("Stealth set error: {e}");
+            format!("Failed to set stealth: {e}")
+        }
+    }
+}
+
 async fn handle_stealth(
     state: &AppState,
     enable: Option<bool>,
@@ -453,18 +486,8 @@ async fn handle_stealth(
     };
 
     if let Some(enable) = enable {
-        match prusa.set_stealth(enable).await {
-            Ok(()) => {
-                let label = if enable { "enabled" } else { "disabled" };
-                bot.send_message(chat, format!("Stealth mode {label}."))
-                    .await?;
-            }
-            Err(e) => {
-                error!("Stealth set error: {e}");
-                bot.send_message(chat, format!("Failed to set stealth: {e}"))
-                    .await?;
-            }
-        }
+        let msg = set_stealth_message(prusa, enable).await;
+        bot.send_message(chat, msg).await?;
     } else {
         match prusa.stealth().await {
             Ok(resp) => {
@@ -488,7 +511,7 @@ async fn handle_stealth(
 }
 
 async fn status_caption(state: &AppState) -> String {
-    let score = state.detection.lock().await.current_score();
+    let score = state.monitor.lock().await.detection.current_score();
     let score_line = format!("Detection score: {score:.2}");
 
     let Some(prusa) = state.prusa.as_ref() else {
