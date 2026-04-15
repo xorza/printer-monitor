@@ -258,7 +258,11 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
         return Ok(());
     }
 
-    let job = status.as_ref().and_then(|s| s.job.as_ref());
+    let Some(status) = status else {
+        return Ok(());
+    };
+
+    let job = status.job.as_ref();
     if let Some(job) = job {
         info!(job_id = job.id, "{}", format_job_info(job));
     }
