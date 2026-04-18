@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Rust service monitoring a Prusa Core One 3D printer for print failures. Pipeline: poll PrusaLink status → capture RTSP webcam snapshot → run through Obico ML detection → if failure detected, pause print via PrusaLink and notify via Telegram bot.
+Rust service monitoring a Prusa Core One 3D printer for print failures. Pipeline: poll PrusaLink status → capture RTSP webcam snapshot → run through Obico ML detection → if failure detected, pause print via PrusaLink and notify via Telegram bot. The same 10-second loop also drives a scheduled stealth-mode on/off (times configured in `settings.toml`) with automatic retry when the printer is offline.
 
-Secrets (PrusaLink API key, Telegram bot token, Obico endpoint, RTSP URL) come from environment variables. Deployed via Docker Compose.
+Config (`.env`): PrusaLink URL/API key, Telegram bot token + chat id, Obico endpoint, RTSP URL, optional `TZ` for the stealth schedule. Runtime toggles (monitoring, auto-pause, stealth schedule) persist to `settings.toml` in the data volume. Deployed via Docker Compose.
 
 ## Commands
 
@@ -32,6 +32,7 @@ cargo run                      # run locally
 - Cover edge cases: empty input, minimal input, boundaries.
 - For parameterized code, test that different parameters produce different results.
 - Skip doc-tests.
+- **Prefer pure decision functions over mocking.** Extract the decision (see `schedule_action`, `check_escalation`, `transition`, `validate_schedule_times`) and let the I/O wrapper call it. Pure fns are unit-tested directly; the thin async wrappers that call them + await HTTP are left untested — they're trivial glue.
 
 ## Documentation
 
