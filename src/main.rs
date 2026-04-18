@@ -145,7 +145,7 @@ async fn run() {
     let config = config::Config::from_env();
     let token = CancellationToken::new();
 
-    let image_server = ImageServer::start(&config.obico_image_host, token.clone()).await;
+    let image_server = ImageServer::start(config.obico_image_port, token.clone()).await;
     info!("Image server started on {}", image_server.addr());
 
     let http_client = reqwest::Client::builder()
@@ -242,14 +242,13 @@ fn spawn_telegram_dispatcher(state: &AppState, cancel: &CancellationToken) -> Sh
             loop {
                 let mut dispatcher = build_dispatcher(&state);
                 *shutdown_token.lock().await = Some(dispatcher.shutdown_token());
-                let result = tokio::task::spawn(async move { dispatcher.dispatch().await }).await;
+                // Panics are handled by the global panic hook (aborts the
+                // process), so we only observe graceful stops here.
+                dispatcher.dispatch().await;
                 if cancel.is_cancelled() {
                     break;
                 }
-                match result {
-                    Ok(()) => error!("Telegram dispatcher stopped, restarting in 5s..."),
-                    Err(e) => error!("Telegram dispatcher panicked: {e}, restarting in 5s..."),
-                }
+                error!("Telegram dispatcher stopped, restarting in 5s...");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }

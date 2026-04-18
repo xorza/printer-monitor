@@ -1,9 +1,8 @@
 use crate::obico::Detection;
 
 const EWM_ALPHA: f64 = 2.0 / (12.0 + 1.0); // span=12, α=0.1538
-const ROLLING_WIN_SHORT: u64 = 310; // ~50 min at 10s
 const ROLLING_WIN_LONG: u64 = 7200; // ~20 hours at 10s
-const GRACE_FRAMES: u64 = 10; // ~2.5 min at 15s
+const GRACE_FRAMES: u64 = 10; // ~100s at POLL_TARGET=10s
 const THRESHOLD_WARNING: f64 = 0.35;
 const THRESHOLD_FAILING: f64 = 0.55;
 
@@ -17,7 +16,6 @@ pub enum DetectionResult {
 #[derive(Debug)]
 pub struct DetectionState {
     ewm_mean: f64,
-    rolling_mean_short: f64,
     rolling_mean_long: f64,
     frame_count: u64,
     lifetime_frame_count: u64,
@@ -29,7 +27,6 @@ impl DetectionState {
     pub fn new(sensitivity: f64) -> Self {
         Self {
             ewm_mean: 0.0,
-            rolling_mean_short: 0.0,
             rolling_mean_long: 0.0,
             frame_count: 0,
             lifetime_frame_count: 0,
@@ -42,11 +39,10 @@ impl DetectionState {
         ((self.ewm_mean - self.rolling_mean_long) * self.sensitivity).max(0.0)
     }
 
-    /// Reset short-term state (EWM, rolling short, frame count).
+    /// Reset short-term state (EWM, frame count).
     /// Call when printer stops printing so next print starts clean.
     pub fn reset_short_term(&mut self) {
         self.ewm_mean = 0.0;
-        self.rolling_mean_short = 0.0;
         self.frame_count = 0;
     }
 
@@ -66,12 +62,6 @@ impl DetectionState {
 
         // Update smoothed signals
         self.ewm_mean = p * EWM_ALPHA + self.ewm_mean * (1.0 - EWM_ALPHA);
-        self.rolling_mean_short = streaming_sma(
-            self.rolling_mean_short,
-            p,
-            self.frame_count,
-            ROLLING_WIN_SHORT,
-        );
         self.rolling_mean_long = streaming_sma(
             self.rolling_mean_long,
             p,
@@ -112,7 +102,6 @@ mod tests {
         Detection {
             label: "failure".to_string(),
             confidence,
-            bbox: [0.0; 4],
         }
     }
 
@@ -166,19 +155,19 @@ mod tests {
     }
 
     #[test]
-    fn rolling_mean_short_math() {
+    fn rolling_mean_long_math() {
         let mut state = DetectionState::new(1.0);
-        // Frame 0: mean = 0 + (0.6 - 0) / min(310, 1) = 0.6
+        // Frame 0: mean = 0 + (0.6 - 0) / min(7200, 1) = 0.6
         state.update(&detections_with_confidence(0.6), None);
-        assert!((state.rolling_mean_short - 0.6).abs() < 1e-10);
+        assert!((state.rolling_mean_long - 0.6).abs() < 1e-10);
 
-        // Frame 1: mean = 0.6 + (0.4 - 0.6) / min(310, 2) = 0.6 + (-0.2/2) = 0.5
+        // Frame 1: mean = 0.6 + (0.4 - 0.6) / min(7200, 2) = 0.6 + (-0.2/2) = 0.5
         state.update(&detections_with_confidence(0.4), None);
-        assert!((state.rolling_mean_short - 0.5).abs() < 1e-10);
+        assert!((state.rolling_mean_long - 0.5).abs() < 1e-10);
 
-        // Frame 2: mean = 0.5 + (0.8 - 0.5) / min(310, 3) = 0.5 + 0.1 = 0.6
+        // Frame 2: mean = 0.5 + (0.8 - 0.5) / min(7200, 3) = 0.5 + 0.1 = 0.6
         state.update(&detections_with_confidence(0.8), None);
-        assert!((state.rolling_mean_short - 0.6).abs() < 1e-10);
+        assert!((state.rolling_mean_long - 0.6).abs() < 1e-10);
     }
 
     #[test]

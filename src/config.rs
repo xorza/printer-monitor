@@ -11,7 +11,10 @@ pub struct Config {
     pub prusalink: Option<PrusaLinkConfig>,
     pub rtsp_url: String,
     pub obico_url: String,
+    /// Full `host:port` advertised to Obico so it can fetch snapshots from us.
     pub obico_image_host: String,
+    /// Port the image server binds to locally — parsed out of `obico_image_host`.
+    pub obico_image_port: u16,
     pub telegram_bot_token: String,
     pub telegram_chat_id: ChatId,
     pub detection_sensitivity: f64,
@@ -45,18 +48,23 @@ impl Config {
             _ => panic!("PRUSALINK_URL and PRUSALINK_API_KEY must both be set or both be unset"),
         };
 
+        let obico_image_host = env("OBICO_IMAGE_HOST");
+        let port_str = obico_image_host
+            .rsplit_once(':')
+            .unwrap_or_else(|| {
+                panic!("OBICO_IMAGE_HOST must be host:port, got: {obico_image_host}")
+            })
+            .1;
+        let obico_image_port: u16 = port_str
+            .parse()
+            .unwrap_or_else(|_| panic!("OBICO_IMAGE_HOST port must be a u16, got: {port_str}"));
+
         Self {
             prusalink,
             rtsp_url: env("RTSP_URL"),
             obico_url: env("OBICO_URL"),
-            obico_image_host: {
-                let host = env("OBICO_IMAGE_HOST");
-                assert!(
-                    host.rsplit_once(':').is_some(),
-                    "OBICO_IMAGE_HOST must be host:port, got: {host}"
-                );
-                host
-            },
+            obico_image_host,
+            obico_image_port,
             telegram_bot_token: env("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id: ChatId(chat_id),
             detection_sensitivity,

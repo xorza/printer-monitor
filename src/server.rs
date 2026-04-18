@@ -11,16 +11,14 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ImageServer {
     image_data: Arc<RwLock<Option<Bytes>>>,
     addr: SocketAddr,
 }
 
 impl ImageServer {
-    pub async fn start(image_host: &str, cancel: CancellationToken) -> Self {
-        // image_host is host:port (validated in Config::from_env); bind to 0.0.0.0 on that port
-        let port = image_host.rsplit_once(':').unwrap().1;
+    pub async fn start(port: u16, cancel: CancellationToken) -> Self {
         Self::bind(&format!("0.0.0.0:{port}"), cancel).await
     }
 

@@ -25,7 +25,6 @@ pub struct DetectionResponse {
 pub struct Detection {
     pub label: String,
     pub confidence: f64,
-    pub bbox: [f64; 4],
 }
 
 impl<'de> Deserialize<'de> for Detection {
@@ -34,13 +33,10 @@ impl<'de> Deserialize<'de> for Detection {
         D: serde::Deserializer<'de>,
     {
         // API returns: ["failure", 0.85, [120.5, 200.3, 50.0, 80.0]]
-        let (label, confidence, bbox): (String, f64, [f64; 4]) =
+        // Bbox is parsed to validate shape but not stored — nothing uses it.
+        let (label, confidence, _bbox): (String, f64, [f64; 4]) =
             Deserialize::deserialize(deserializer)?;
-        Ok(Detection {
-            label,
-            confidence,
-            bbox,
-        })
+        Ok(Detection { label, confidence })
     }
 }
 
@@ -93,11 +89,9 @@ mod tests {
 
         assert_eq!(resp.detections[0].label, "failure");
         assert_eq!(resp.detections[0].confidence, 0.85);
-        assert_eq!(resp.detections[0].bbox, [120.5, 200.3, 50.0, 80.0]);
 
         assert_eq!(resp.detections[1].label, "failure");
         assert_eq!(resp.detections[1].confidence, 0.42);
-        assert_eq!(resp.detections[1].bbox, [300.1, 150.7, 60.0, 45.0]);
     }
 
     #[test]
