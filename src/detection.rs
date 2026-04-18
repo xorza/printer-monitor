@@ -63,7 +63,7 @@ impl DetectionState {
 
         // Update smoothed signals
         self.ewm_mean = p * EWM_ALPHA + self.ewm_mean * (1.0 - EWM_ALPHA);
-        self.baseline_mean = streaming_sma(
+        self.baseline_mean = running_mean(
             self.baseline_mean,
             p,
             self.lifetime_frame_count,
@@ -88,9 +88,11 @@ impl DetectionState {
     }
 }
 
-/// Streaming simple moving average. `count` is the number of samples already
-/// integrated into `mean`; `window` caps the effective averaging length.
-fn streaming_sma(mean: f64, sample: f64, count: u64, window: u64) -> f64 {
+/// Running mean with a bounded memory. Warmup (while `count < window`) is a
+/// cumulative mean — each sample gets equal weight. Steady state (once
+/// `count >= window`) is an EWMA with α = 1/window — recent samples dominate
+/// and the mean can drift with the baseline.
+fn running_mean(mean: f64, sample: f64, count: u64, window: u64) -> f64 {
     let divisor = window.min(count + 1) as f64;
     mean + (sample - mean) / divisor
 }
