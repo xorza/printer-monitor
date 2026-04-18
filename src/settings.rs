@@ -3,12 +3,16 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
+use crate::schedule::StealthSchedule;
+
 const DEFAULT_PATH: &str = "settings.toml";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
     pub monitoring_enabled: bool,
     pub auto_pause: bool,
+    #[serde(default)]
+    pub stealth_schedule: StealthSchedule,
 }
 
 impl Default for Settings {
@@ -16,6 +20,7 @@ impl Default for Settings {
         Self {
             monitoring_enabled: true,
             auto_pause: true,
+            stealth_schedule: StealthSchedule::default(),
         }
     }
 }
@@ -80,10 +85,25 @@ mod tests {
         let s = Settings {
             monitoring_enabled: false,
             auto_pause: true,
+            stealth_schedule: StealthSchedule {
+                enabled: true,
+                off_at: "07:30".to_string(),
+                on_at: "21:15".to_string(),
+            },
         };
         let toml = toml::to_string_pretty(&s).unwrap();
         let loaded: Settings = toml::from_str(&toml).unwrap();
         assert_eq!(s, loaded);
+    }
+
+    #[test]
+    fn load_old_format_without_schedule_gets_default() {
+        // Existing deployments have settings.toml without stealth_schedule — must not crash.
+        let toml_text = "monitoring_enabled = true\nauto_pause = false\n";
+        let loaded: Settings = toml::from_str(toml_text).unwrap();
+        assert!(loaded.monitoring_enabled);
+        assert!(!loaded.auto_pause);
+        assert_eq!(loaded.stealth_schedule, StealthSchedule::default());
     }
 
     #[test]
@@ -108,6 +128,11 @@ mod tests {
         let s = Settings {
             monitoring_enabled: false,
             auto_pause: false,
+            stealth_schedule: StealthSchedule {
+                enabled: true,
+                off_at: "09:00".to_string(),
+                on_at: "22:00".to_string(),
+            },
         };
         s.save_to(&path);
         let loaded = Settings::load_from(&path);

@@ -3,6 +3,7 @@ pub mod detection;
 pub mod obico;
 pub mod prusalink;
 pub mod rtsp_capture;
+pub mod schedule;
 pub mod server;
 pub mod settings;
 pub mod telegram;
@@ -12,6 +13,7 @@ use std::time::Duration;
 
 use detection::{DetectionResult, DetectionState};
 use prusalink::{JobStatus, PrinterState, PrusaLink, StatusResponse};
+use schedule::{ScheduleAction, ScheduleConfigStatus, StealthSchedule, Window};
 use server::ImageServer;
 use teloxide::dispatching::{DefaultKey, HandlerExt, ShutdownToken};
 use teloxide::prelude::*;
@@ -59,6 +61,8 @@ struct MonitorState {
     alert_level: AlertLevel,
     monitoring_enabled: bool,
     auto_pause: bool,
+    stealth_schedule: StealthSchedule,
+    last_applied_window: Option<Window>,
 }
 
 impl MonitorState {
@@ -66,6 +70,7 @@ impl MonitorState {
         settings::Settings {
             monitoring_enabled: self.monitoring_enabled,
             auto_pause: self.auto_pause,
+            stealth_schedule: self.stealth_schedule.clone(),
         }
         .save();
     }
@@ -96,6 +101,8 @@ enum Command {
     Monitor(String),
     /// Toggle auto-pause on failure: /autopause [on|off|1|0|true|false]
     Autopause(String),
+    /// Toggle scheduled stealth mode: /stealthschedule [on|off|1|0|true|false]
+    Stealthschedule(String),
 }
 
 type SharedShutdownToken = Arc<Mutex<Option<ShutdownToken>>>;
@@ -150,12 +157,15 @@ async fn run() {
         image_server: Arc::new(image_server),
         monitor: Arc::new(Mutex::new({
             let s = settings::Settings::load();
+            log_schedule_config(&s.stealth_schedule);
             MonitorState {
                 detection: DetectionState::new(config.detection_sensitivity),
                 printer_state: PrinterState::Idle,
                 alert_level: AlertLevel::Safe,
                 monitoring_enabled: s.monitoring_enabled,
                 auto_pause: s.auto_pause,
+                stealth_schedule: s.stealth_schedule,
+                last_applied_window: None,
             }
         })),
     };
@@ -252,6 +262,8 @@ fn build_dispatcher(state: &AppState) -> Dispatcher<Bot, teloxide::RequestError,
 }
 
 async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
+    tick_stealth_schedule(state).await;
+
     let status = poll_printer(state).await?;
 
     if !state.monitor.lock().await.monitoring_enabled {
@@ -279,6 +291,53 @@ async fn monitor_cycle(state: &AppState) -> Result<(), MonitorError> {
 
     let paused = try_pause(state, alert, auto_pause, job).await;
     send_alert(state, jpeg, score, paused, job).await
+}
+
+fn log_schedule_config(s: &StealthSchedule) {
+    match schedule::validate_schedule_times(s) {
+        ScheduleConfigStatus::Disabled => info!("Stealth schedule: disabled"),
+        ScheduleConfigStatus::Ok => info!(
+            "Stealth schedule: enabled — stealth OFF at {}, ON at {} (local time)",
+            s.off_at, s.on_at
+        ),
+        ScheduleConfigStatus::InvalidTimes => warn!(
+            "Stealth schedule is enabled but times don't parse: off_at={:?}, on_at={:?}. \
+             Schedule will not fire. Use HH:MM format (e.g. \"08:00\").",
+            s.off_at, s.on_at
+        ),
+    }
+}
+
+/// Apply the scheduled stealth state for the current window. NoOp when the
+/// schedule is disabled, times don't parse, or the window hasn't changed
+/// since the last successful apply. On PrusaLink failure, `last_applied_window`
+/// is left untouched so the next 10s tick retries — this is the "printer was
+/// offline at 8am" recovery path.
+async fn tick_stealth_schedule(state: &AppState) {
+    let Some(prusa) = &state.prusa else {
+        return;
+    };
+    let action = {
+        let mon = state.monitor.lock().await;
+        schedule::schedule_action(
+            &mon.stealth_schedule,
+            mon.last_applied_window,
+            chrono::Local::now().time(),
+        )
+    };
+    let ScheduleAction::Apply(window) = action else {
+        return;
+    };
+    let stealth_on = window.stealth_on();
+    match prusa.set_stealth(stealth_on).await {
+        Ok(()) => {
+            info!(?window, stealth_on, "Applied scheduled stealth");
+            state.monitor.lock().await.last_applied_window = Some(window);
+        }
+        Err(e) => {
+            warn!(?window, "Scheduled stealth apply failed, will retry: {e}");
+        }
+    }
 }
 
 /// Poll printer and update state. Handles non-printing transitions
@@ -460,12 +519,16 @@ async fn handle_command(
                 }
             }
         }
-        Command::Stealth(ref arg) | Command::Monitor(ref arg) | Command::Autopause(ref arg) => {
+        Command::Stealth(ref arg)
+        | Command::Monitor(ref arg)
+        | Command::Autopause(ref arg)
+        | Command::Stealthschedule(ref arg) => {
             let Some(enable) = parse_toggle(arg) else {
                 let name = match &cmd {
                     Command::Stealth(_) => "stealth",
                     Command::Monitor(_) => "monitor",
                     Command::Autopause(_) => "autopause",
+                    Command::Stealthschedule(_) => "stealthschedule",
                     _ => unreachable!(),
                 };
                 bot.send_message(chat, format!("Usage: /{name} [on|off|1|0|true|false]"))
@@ -500,6 +563,9 @@ async fn handle_command(
                         chat,
                     )
                     .await?;
+                }
+                Command::Stealthschedule(_) => {
+                    handle_schedule_toggle(&state, enable, &bot, chat).await?;
                 }
                 _ => unreachable!(),
             }
@@ -540,6 +606,10 @@ async fn handle_callback(
         "autopause on" | "autopause off" => {
             let enable = data == "autopause on";
             set_toggle(&state, enable, "Auto-pause", |m| &mut m.auto_pause).await
+        }
+        "stealthschedule on" | "stealthschedule off" => {
+            let enable = data == "stealthschedule on";
+            set_schedule_toggle(&state, enable).await
         }
         _ => {
             bot.answer_callback_query(q.id).await?;
@@ -671,6 +741,57 @@ async fn handle_toggle(
         bot.send_message(chat, format!("{label} is {status}."))
             .reply_markup(buttons)
             .await?;
+    }
+    Ok(())
+}
+
+/// Toggle the stealth schedule enabled flag. Always clears
+/// `last_applied_window` so the next monitor tick re-applies (otherwise a
+/// disable/enable cycle could leave the printer out of sync with the schedule
+/// until the next boundary).
+async fn set_schedule_toggle(state: &AppState, enable: bool) -> String {
+    let mut mon = state.monitor.lock().await;
+    mon.stealth_schedule.enabled = enable;
+    mon.last_applied_window = None;
+    let status = schedule::validate_schedule_times(&mon.stealth_schedule);
+    mon.save_settings();
+    let action = if enable { "enabled" } else { "disabled" };
+    let mut msg = format!("Stealth schedule {action}.");
+    if status == ScheduleConfigStatus::InvalidTimes {
+        msg.push_str(
+            "\nWarning: configured times don't parse — schedule will not fire. \
+             Fix off_at/on_at in settings.toml (HH:MM format).",
+        );
+    }
+    msg
+}
+
+async fn handle_schedule_toggle(
+    state: &AppState,
+    enable: Option<bool>,
+    bot: &Bot,
+    chat: ChatId,
+) -> Result<(), teloxide::RequestError> {
+    if let Some(enable) = enable {
+        let msg = set_schedule_toggle(state, enable).await;
+        bot.send_message(chat, msg).await?;
+    } else {
+        let mon = state.monitor.lock().await;
+        let status = if mon.stealth_schedule.enabled {
+            "ON"
+        } else {
+            "OFF"
+        };
+        let msg = format!(
+            "Stealth schedule is {status}.\nStealth OFF at {}, ON at {}.",
+            mon.stealth_schedule.off_at, mon.stealth_schedule.on_at
+        );
+        drop(mon);
+        let buttons = InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback("On", "stealthschedule on"),
+            InlineKeyboardButton::callback("Off", "stealthschedule off"),
+        ]]);
+        bot.send_message(chat, msg).reply_markup(buttons).await?;
     }
     Ok(())
 }
@@ -841,6 +962,8 @@ mod tests {
             alert_level: AlertLevel::Safe,
             monitoring_enabled,
             auto_pause,
+            stealth_schedule: StealthSchedule::default(),
+            last_applied_window: None,
         }
     }
 
