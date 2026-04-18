@@ -1,11 +1,12 @@
+use std::net::SocketAddr;
+use std::sync::{Arc, RwLock};
+
 use axum::Router;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use bytes::Bytes;
-use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::error;

@@ -9,6 +9,24 @@ use retina::codec::{CodecItem, FrameFormat};
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 const JPEG_QUALITY: u8 = 85;
 
+#[derive(Debug, thiserror::Error)]
+pub enum CaptureError {
+    #[error("timed out")]
+    Timeout,
+    #[error("no H.264 video stream found")]
+    NoVideoStream,
+    #[error("stream ended without producing a frame")]
+    NoFrame,
+    #[error("RTSP: {0}")]
+    Rtsp(#[from] retina::Error),
+    #[error("H.264 decode: {0}")]
+    Decode(#[from] openh264::Error),
+    #[error("I/O: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JPEG encode: {0}")]
+    Jpeg(#[from] jpeg_encoder::EncodingError),
+}
+
 #[derive(Debug)]
 pub struct RtspCapture {
     url: url::Url,
@@ -102,24 +120,6 @@ async fn decode_first_frame(
     }
 
     Err(CaptureError::NoFrame)
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum CaptureError {
-    #[error("timed out")]
-    Timeout,
-    #[error("no H.264 video stream found")]
-    NoVideoStream,
-    #[error("stream ended without producing a frame")]
-    NoFrame,
-    #[error("RTSP: {0}")]
-    Rtsp(#[from] retina::Error),
-    #[error("H.264 decode: {0}")]
-    Decode(#[from] openh264::Error),
-    #[error("I/O: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("JPEG encode: {0}")]
-    Jpeg(#[from] jpeg_encoder::EncodingError),
 }
 
 #[cfg(test)]

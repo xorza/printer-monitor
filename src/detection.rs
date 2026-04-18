@@ -1,10 +1,5 @@
 use crate::obico::Detection;
 
-fn streaming_sma(mean: f64, sample: f64, count: u64, window: u64) -> f64 {
-    let divisor = window.min(count + 1) as f64;
-    mean + (sample - mean) / divisor
-}
-
 const EWM_ALPHA: f64 = 2.0 / (12.0 + 1.0); // span=12, α=0.1538
 const ROLLING_WIN_SHORT: u64 = 310; // ~50 min at 10s
 const ROLLING_WIN_LONG: u64 = 7200; // ~20 hours at 10s
@@ -100,6 +95,13 @@ impl DetectionState {
             DetectionResult::Safe
         }
     }
+}
+
+/// Streaming simple moving average. `count` is the number of samples already
+/// integrated into `mean`; `window` caps the effective averaging length.
+fn streaming_sma(mean: f64, sample: f64, count: u64, window: u64) -> f64 {
+    let divisor = window.min(count + 1) as f64;
+    mean + (sample - mean) / divisor
 }
 
 #[cfg(test)]
