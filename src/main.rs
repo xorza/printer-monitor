@@ -360,6 +360,28 @@ async fn tick_stealth_schedule(state: &AppState) {
     }
 }
 
+/// Classifies the (prev, current) printer-state pair so the I/O wrapper
+/// knows whether to keep going, notify the user, or just reset state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transition {
+    /// Currently printing — detection continues, no action needed.
+    Active,
+    /// Was printing, now not. Reset detection AND notify the user with the
+    /// terminal state (so they see "Print stopped — printer is now Paused").
+    Stopped(PrinterState),
+    /// Wasn't printing, still isn't. Reset detection; don't notify (no print
+    /// was active to "stop").
+    Idle,
+}
+
+fn transition(prev: PrinterState, current: PrinterState) -> Transition {
+    match (prev, current) {
+        (_, PrinterState::Printing) => Transition::Active,
+        (PrinterState::Printing, stopped) => Transition::Stopped(stopped),
+        _ => Transition::Idle,
+    }
+}
+
 /// Poll printer and update state. Handles non-printing transitions
 /// (reset detection, notify on stop). Returns `None` if not printing.
 async fn poll_printer(state: &AppState) -> Result<Option<StatusResponse>, MonitorError> {
@@ -371,21 +393,25 @@ async fn poll_printer(state: &AppState) -> Result<Option<StatusResponse>, Monito
     let current = status.printer.state;
     info!(state = ?current, "Printer status");
 
-    let mut mon = state.monitor.lock().await;
-    let was_printing = mon.printer_state == PrinterState::Printing;
-    mon.printer_state = current;
-
-    if current != PrinterState::Printing {
-        mon.detection.reset_short_term();
-        mon.alert_level = AlertLevel::Safe;
-        drop(mon);
-        if was_printing {
-            notify_print_stopped(state, current).await?;
+    let t = {
+        let mut mon = state.monitor.lock().await;
+        let t = transition(mon.printer_state, current);
+        mon.printer_state = current;
+        if !matches!(t, Transition::Active) {
+            mon.detection.reset_short_term();
+            mon.alert_level = AlertLevel::Safe;
         }
-        return Ok(None);
-    }
+        t
+    };
 
-    Ok(Some(status))
+    match t {
+        Transition::Active => Ok(Some(status)),
+        Transition::Stopped(stopped_at) => {
+            notify_print_stopped(state, stopped_at).await?;
+            Ok(None)
+        }
+        Transition::Idle => Ok(None),
+    }
 }
 
 async fn notify_print_stopped(
@@ -404,27 +430,29 @@ async fn notify_print_stopped(
     Ok(())
 }
 
-/// Check alert escalation against current level.
-/// Returns `None` if safe or no escalation (already notified at this level).
-fn check_escalation(
-    mon: &mut MonitorState,
-    result: DetectionResult,
-) -> Option<(AlertLevel, f64, bool)> {
-    let (alert, score) = match result {
-        DetectionResult::Safe => {
-            mon.alert_level = AlertLevel::Safe;
-            return None;
-        }
+/// Decide what the caller should do with `MonitorState.alert_level` given
+/// the current level and a new detection result. Pure — caller applies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EscalationAction {
+    /// Alert level stays put.
+    None,
+    /// Detection came back clean — drop alert_level to Safe.
+    Reset,
+    /// New higher alert level — raise alert_level and notify.
+    Escalate { level: AlertLevel, score: f64 },
+}
+
+fn check_escalation(current: AlertLevel, result: DetectionResult) -> EscalationAction {
+    let (level, score) = match result {
+        DetectionResult::Safe => return EscalationAction::Reset,
         DetectionResult::Warning { score } => (AlertLevel::Warning, score),
         DetectionResult::Failing { score } => (AlertLevel::Failing, score),
     };
-
-    if alert <= mon.alert_level {
-        return None;
+    if level <= current {
+        EscalationAction::None
+    } else {
+        EscalationAction::Escalate { level, score }
     }
-
-    mon.alert_level = alert;
-    Some((alert, score, mon.auto_pause))
 }
 
 async fn process_detection(
@@ -436,7 +464,17 @@ async fn process_detection(
     let result = mon
         .detection
         .update(&obico_result.detections, job.map(|j| j.id));
-    let escalation = check_escalation(&mut mon, result);
+    let escalation = match check_escalation(mon.alert_level, result) {
+        EscalationAction::None => None,
+        EscalationAction::Reset => {
+            mon.alert_level = AlertLevel::Safe;
+            None
+        }
+        EscalationAction::Escalate { level, score } => {
+            mon.alert_level = level;
+            Some((level, score, mon.auto_pause))
+        }
+    };
 
     match &escalation {
         Some((level, score, _)) => error!(?level, score, "Detection alert escalated"),
@@ -979,80 +1017,60 @@ mod tests {
         assert!(AlertLevel::Failing <= AlertLevel::Failing);
     }
 
-    fn mon(monitoring_enabled: bool, auto_pause: bool) -> MonitorState {
-        MonitorState {
-            detection: DetectionState::new(1.0),
-            printer_state: PrinterState::Idle,
-            alert_level: AlertLevel::Safe,
-            monitoring_enabled,
-            auto_pause,
-            stealth_schedule: StealthSchedule::default(),
-            last_applied_window: None,
-        }
-    }
-
     #[test]
-    fn escalation_safe_resets_alert_level() {
-        let mut m = mon(true, true);
-        m.alert_level = AlertLevel::Warning;
-        let result = check_escalation(&mut m, DetectionResult::Safe);
-        assert!(result.is_none());
-        assert_eq!(m.alert_level, AlertLevel::Safe);
+    fn escalation_safe_is_reset() {
+        assert_eq!(
+            check_escalation(AlertLevel::Warning, DetectionResult::Safe),
+            EscalationAction::Reset,
+        );
+        // Reset is returned even if already Safe — caller writes Safe either way.
+        assert_eq!(
+            check_escalation(AlertLevel::Safe, DetectionResult::Safe),
+            EscalationAction::Reset,
+        );
     }
 
     #[test]
     fn escalation_safe_to_warning() {
-        let mut m = mon(true, true);
-        let result = check_escalation(&mut m, DetectionResult::Warning { score: 0.4 });
-        assert!(result.is_some());
-        let (alert, score, _) = result.unwrap();
-        assert_eq!(alert, AlertLevel::Warning);
-        assert_eq!(score, 0.4);
-        assert_eq!(m.alert_level, AlertLevel::Warning);
+        assert_eq!(
+            check_escalation(AlertLevel::Safe, DetectionResult::Warning { score: 0.4 }),
+            EscalationAction::Escalate {
+                level: AlertLevel::Warning,
+                score: 0.4,
+            },
+        );
     }
 
     #[test]
     fn escalation_warning_to_failing() {
-        let mut m = mon(true, true);
-        m.alert_level = AlertLevel::Warning;
-        let result = check_escalation(&mut m, DetectionResult::Failing { score: 0.7 });
-        assert!(result.is_some());
-        let (alert, _, _) = result.unwrap();
-        assert_eq!(alert, AlertLevel::Failing);
-        assert_eq!(m.alert_level, AlertLevel::Failing);
+        assert_eq!(
+            check_escalation(AlertLevel::Warning, DetectionResult::Failing { score: 0.7 }),
+            EscalationAction::Escalate {
+                level: AlertLevel::Failing,
+                score: 0.7,
+            },
+        );
     }
 
     #[test]
     fn escalation_suppressed_at_same_level() {
-        let mut m = mon(true, true);
-        m.alert_level = AlertLevel::Warning;
-        let result = check_escalation(&mut m, DetectionResult::Warning { score: 0.5 });
-        assert!(result.is_none());
-        // alert_level unchanged
-        assert_eq!(m.alert_level, AlertLevel::Warning);
+        assert_eq!(
+            check_escalation(AlertLevel::Warning, DetectionResult::Warning { score: 0.5 }),
+            EscalationAction::None,
+        );
+        assert_eq!(
+            check_escalation(AlertLevel::Failing, DetectionResult::Failing { score: 0.9 }),
+            EscalationAction::None,
+        );
     }
 
     #[test]
     fn escalation_suppressed_at_higher_level() {
-        let mut m = mon(true, true);
-        m.alert_level = AlertLevel::Failing;
-        let result = check_escalation(&mut m, DetectionResult::Warning { score: 0.4 });
-        assert!(result.is_none());
-        // stays at Failing, not downgraded
-        assert_eq!(m.alert_level, AlertLevel::Failing);
-    }
-
-    #[test]
-    fn escalation_returns_auto_pause_setting() {
-        let mut m = mon(true, false);
-        let result = check_escalation(&mut m, DetectionResult::Failing { score: 0.8 });
-        let (_, _, auto_pause) = result.unwrap();
-        assert!(!auto_pause);
-
-        let mut m = mon(true, true);
-        let result = check_escalation(&mut m, DetectionResult::Failing { score: 0.8 });
-        let (_, _, auto_pause) = result.unwrap();
-        assert!(auto_pause);
+        // Failing state receives Warning — don't downgrade.
+        assert_eq!(
+            check_escalation(AlertLevel::Failing, DetectionResult::Warning { score: 0.4 }),
+            EscalationAction::None,
+        );
     }
 
     #[test]
@@ -1064,53 +1082,130 @@ mod tests {
         assert!(!should_pause(AlertLevel::Safe, true));
     }
 
+    /// Simulates how `process_detection` applies `EscalationAction` to a
+    /// running alert level across a sequence of detection results.
     #[test]
-    fn full_flow_safe_to_warning_to_failing() {
-        let mut m = mon(true, true);
+    fn escalation_sequence_safe_to_warning_to_failing_and_back() {
+        fn apply(current: &mut AlertLevel, result: DetectionResult) -> EscalationAction {
+            let action = check_escalation(*current, result);
+            match action {
+                EscalationAction::Reset => *current = AlertLevel::Safe,
+                EscalationAction::Escalate { level, .. } => *current = level,
+                EscalationAction::None => {}
+            }
+            action
+        }
 
-        // First: safe
-        let result = check_escalation(&mut m, DetectionResult::Safe);
-        assert!(result.is_none());
-        assert_eq!(m.alert_level, AlertLevel::Safe);
+        let mut current = AlertLevel::Safe;
 
-        // Escalate to warning
-        let result = check_escalation(&mut m, DetectionResult::Warning { score: 0.4 });
-        assert!(result.is_some());
-        assert_eq!(m.alert_level, AlertLevel::Warning);
+        assert_eq!(
+            apply(&mut current, DetectionResult::Safe),
+            EscalationAction::Reset
+        );
+        assert_eq!(current, AlertLevel::Safe);
+
+        assert!(matches!(
+            apply(&mut current, DetectionResult::Warning { score: 0.4 }),
+            EscalationAction::Escalate {
+                level: AlertLevel::Warning,
+                ..
+            }
+        ));
+        assert_eq!(current, AlertLevel::Warning);
 
         // Repeated warning suppressed
-        let result = check_escalation(&mut m, DetectionResult::Warning { score: 0.45 });
-        assert!(result.is_none());
+        assert_eq!(
+            apply(&mut current, DetectionResult::Warning { score: 0.45 }),
+            EscalationAction::None,
+        );
+        assert_eq!(current, AlertLevel::Warning);
 
-        // Escalate to failing
-        let result = check_escalation(&mut m, DetectionResult::Failing { score: 0.7 });
-        assert!(result.is_some());
-        assert_eq!(m.alert_level, AlertLevel::Failing);
-        let (_, _, auto_pause) = result.unwrap();
-        assert!(should_pause(AlertLevel::Failing, auto_pause));
+        // Escalate Warning → Failing
+        assert!(matches!(
+            apply(&mut current, DetectionResult::Failing { score: 0.7 }),
+            EscalationAction::Escalate {
+                level: AlertLevel::Failing,
+                ..
+            }
+        ));
+        assert_eq!(current, AlertLevel::Failing);
 
         // Repeated failing suppressed
-        let result = check_escalation(&mut m, DetectionResult::Failing { score: 0.8 });
-        assert!(result.is_none());
+        assert_eq!(
+            apply(&mut current, DetectionResult::Failing { score: 0.8 }),
+            EscalationAction::None,
+        );
 
-        // Back to safe resets
-        let result = check_escalation(&mut m, DetectionResult::Safe);
-        assert!(result.is_none());
-        assert_eq!(m.alert_level, AlertLevel::Safe);
+        // Safe resets
+        assert_eq!(
+            apply(&mut current, DetectionResult::Safe),
+            EscalationAction::Reset
+        );
+        assert_eq!(current, AlertLevel::Safe);
 
         // Can escalate again after reset
-        let result = check_escalation(&mut m, DetectionResult::Warning { score: 0.35 });
-        assert!(result.is_some());
+        assert!(matches!(
+            apply(&mut current, DetectionResult::Warning { score: 0.35 }),
+            EscalationAction::Escalate { .. }
+        ));
+    }
+
+    // --- transition ---
+
+    #[test]
+    fn transition_idle_to_printing_is_active() {
+        assert_eq!(
+            transition(PrinterState::Idle, PrinterState::Printing),
+            Transition::Active,
+        );
     }
 
     #[test]
-    fn full_flow_auto_pause_off_still_alerts_but_no_pause() {
-        let mut m = mon(true, false);
+    fn transition_printing_to_printing_is_active() {
+        assert_eq!(
+            transition(PrinterState::Printing, PrinterState::Printing),
+            Transition::Active,
+        );
+    }
 
-        let result = check_escalation(&mut m, DetectionResult::Failing { score: 0.8 });
-        assert!(result.is_some());
-        let (alert, _, auto_pause) = result.unwrap();
-        assert_eq!(alert, AlertLevel::Failing);
-        assert!(!should_pause(alert, auto_pause));
+    #[test]
+    fn transition_printing_to_idle_stops() {
+        assert_eq!(
+            transition(PrinterState::Printing, PrinterState::Idle),
+            Transition::Stopped(PrinterState::Idle),
+        );
+    }
+
+    #[test]
+    fn transition_printing_to_paused_stops() {
+        assert_eq!(
+            transition(PrinterState::Printing, PrinterState::Paused),
+            Transition::Stopped(PrinterState::Paused),
+        );
+    }
+
+    #[test]
+    fn transition_printing_to_error_stops() {
+        assert_eq!(
+            transition(PrinterState::Printing, PrinterState::Error),
+            Transition::Stopped(PrinterState::Error),
+        );
+    }
+
+    #[test]
+    fn transition_idle_to_idle() {
+        assert_eq!(
+            transition(PrinterState::Idle, PrinterState::Idle),
+            Transition::Idle,
+        );
+    }
+
+    #[test]
+    fn transition_paused_to_error_is_idle() {
+        // Neither end is Printing — no notification, just state reset.
+        assert_eq!(
+            transition(PrinterState::Paused, PrinterState::Error),
+            Transition::Idle,
+        );
     }
 }
