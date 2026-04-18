@@ -1,58 +1,4 @@
-use std::io::Write;
-use std::sync::Mutex;
-
 use crate::obico::Detection;
-
-static LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
-
-fn init_log() {
-    let mut guard = LOG_FILE.lock().unwrap();
-    if guard.is_none() {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("detection_log.csv")
-            .expect("failed to open detection_log.csv");
-        // Write header only if file is empty
-        if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
-            writeln!(
-                f,
-                "timestamp,n_detections,confidences,p,ewm_mean,rolling_short,rolling_long,score,frame_count,result"
-            )
-            .ok();
-        }
-        *guard = Some(f);
-    }
-}
-
-fn log_detection(state: &DetectionState, detections: &[Detection], p: f64, result: &str) {
-    let mut guard = LOG_FILE.lock().unwrap();
-    if let Some(f) = guard.as_mut() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let confidences: Vec<String> = detections
-            .iter()
-            .map(|d| format!("{:.4}", d.confidence))
-            .collect();
-        writeln!(
-            f,
-            "{},{},{},{:.6},{:.6},{:.6},{:.6},{:.4},{},{}",
-            now,
-            detections.len(),
-            confidences.join(";"),
-            p,
-            state.ewm_mean,
-            state.rolling_mean_short,
-            state.rolling_mean_long,
-            state.current_score(),
-            state.frame_count,
-            result,
-        )
-        .ok();
-    }
-}
 
 fn streaming_sma(mean: f64, sample: f64, count: u64, window: u64) -> f64 {
     let divisor = window.min(count + 1) as f64;
@@ -86,7 +32,6 @@ pub struct DetectionState {
 
 impl DetectionState {
     pub fn new(sensitivity: f64) -> Self {
-        init_log();
         Self {
             ewm_mean: 0.0,
             rolling_mean_short: 0.0,
@@ -145,7 +90,7 @@ impl DetectionState {
         let score = self.current_score();
 
         // Grace period
-        let result = if self.frame_count <= GRACE_FRAMES {
+        if self.frame_count <= GRACE_FRAMES {
             DetectionResult::Safe
         } else if score >= THRESHOLD_FAILING {
             DetectionResult::Failing { score }
@@ -153,20 +98,7 @@ impl DetectionState {
             DetectionResult::Warning { score }
         } else {
             DetectionResult::Safe
-        };
-
-        log_detection(
-            self,
-            detections,
-            p,
-            match &result {
-                DetectionResult::Safe => "safe",
-                DetectionResult::Warning { .. } => "warning",
-                DetectionResult::Failing { .. } => "failing",
-            },
-        );
-
-        result
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
@@ -60,10 +60,6 @@ impl Settings {
         if let Err(e) = std::fs::write(path, contents) {
             error!("Failed to save settings to {}: {e}", path.display());
         }
-    }
-
-    pub fn path() -> PathBuf {
-        PathBuf::from(DEFAULT_PATH)
     }
 }
 

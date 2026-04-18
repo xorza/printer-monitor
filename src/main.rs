@@ -38,12 +38,23 @@ enum MonitorError {
 const POLL_TARGET: Duration = Duration::from_secs(10);
 const POLL_MIN_SLEEP: Duration = Duration::from_secs(1);
 
-fn parse_toggle(arg: &str) -> Option<Option<bool>> {
+/// Result of parsing a toggle-command argument (e.g. `/monitor on`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToggleArg {
+    /// Unrecognized input — surface a usage message.
+    Invalid,
+    /// No argument — query current state and show buttons.
+    Query,
+    /// Explicit set: `/monitor on` → `Set(true)`, `/monitor off` → `Set(false)`.
+    Set(bool),
+}
+
+fn parse_toggle(arg: &str) -> ToggleArg {
     match arg.trim().to_lowercase().as_str() {
-        "on" | "1" | "true" => Some(Some(true)),
-        "off" | "0" | "false" => Some(Some(false)),
-        "" => Some(None),
-        _ => None,
+        "on" | "1" | "true" => ToggleArg::Set(true),
+        "off" | "0" | "false" => ToggleArg::Set(false),
+        "" => ToggleArg::Query,
+        _ => ToggleArg::Invalid,
     }
 }
 
@@ -108,6 +119,15 @@ enum Command {
 type SharedShutdownToken = Arc<Mutex<Option<ShutdownToken>>>;
 
 fn main() {
+    // Any panic — in any task, any thread — aborts the whole process.
+    // Without this, a panic inside a tokio::spawn dies silently and leaves
+    // the rest of the app running in a half-broken state.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        std::process::abort();
+    }));
+
     let _ = dotenvy::dotenv();
 
     tracing_subscriber::fmt()
@@ -523,17 +543,21 @@ async fn handle_command(
         | Command::Monitor(ref arg)
         | Command::Autopause(ref arg)
         | Command::Stealthschedule(ref arg) => {
-            let Some(enable) = parse_toggle(arg) else {
-                let name = match &cmd {
-                    Command::Stealth(_) => "stealth",
-                    Command::Monitor(_) => "monitor",
-                    Command::Autopause(_) => "autopause",
-                    Command::Stealthschedule(_) => "stealthschedule",
-                    _ => unreachable!(),
-                };
-                bot.send_message(chat, format!("Usage: /{name} [on|off|1|0|true|false]"))
-                    .await?;
-                return Ok(());
+            let enable = match parse_toggle(arg) {
+                ToggleArg::Set(v) => Some(v),
+                ToggleArg::Query => None,
+                ToggleArg::Invalid => {
+                    let name = match &cmd {
+                        Command::Stealth(_) => "stealth",
+                        Command::Monitor(_) => "monitor",
+                        Command::Autopause(_) => "autopause",
+                        Command::Stealthschedule(_) => "stealthschedule",
+                        _ => unreachable!(),
+                    };
+                    bot.send_message(chat, format!("Usage: /{name} [on|off|1|0|true|false]"))
+                        .await?;
+                    return Ok(());
+                }
             };
             match cmd {
                 Command::Stealth(_) => {
@@ -845,34 +869,34 @@ mod tests {
 
     #[test]
     fn parse_toggle_on_variants() {
-        assert_eq!(parse_toggle("on"), Some(Some(true)));
-        assert_eq!(parse_toggle("1"), Some(Some(true)));
-        assert_eq!(parse_toggle("true"), Some(Some(true)));
-        assert_eq!(parse_toggle("ON"), Some(Some(true)));
-        assert_eq!(parse_toggle("True"), Some(Some(true)));
-        assert_eq!(parse_toggle("  on  "), Some(Some(true)));
+        assert_eq!(parse_toggle("on"), ToggleArg::Set(true));
+        assert_eq!(parse_toggle("1"), ToggleArg::Set(true));
+        assert_eq!(parse_toggle("true"), ToggleArg::Set(true));
+        assert_eq!(parse_toggle("ON"), ToggleArg::Set(true));
+        assert_eq!(parse_toggle("True"), ToggleArg::Set(true));
+        assert_eq!(parse_toggle("  on  "), ToggleArg::Set(true));
     }
 
     #[test]
     fn parse_toggle_off_variants() {
-        assert_eq!(parse_toggle("off"), Some(Some(false)));
-        assert_eq!(parse_toggle("0"), Some(Some(false)));
-        assert_eq!(parse_toggle("false"), Some(Some(false)));
-        assert_eq!(parse_toggle("OFF"), Some(Some(false)));
+        assert_eq!(parse_toggle("off"), ToggleArg::Set(false));
+        assert_eq!(parse_toggle("0"), ToggleArg::Set(false));
+        assert_eq!(parse_toggle("false"), ToggleArg::Set(false));
+        assert_eq!(parse_toggle("OFF"), ToggleArg::Set(false));
     }
 
     #[test]
-    fn parse_toggle_empty_returns_none_value() {
-        assert_eq!(parse_toggle(""), Some(None));
-        assert_eq!(parse_toggle("  "), Some(None));
+    fn parse_toggle_empty_is_query() {
+        assert_eq!(parse_toggle(""), ToggleArg::Query);
+        assert_eq!(parse_toggle("  "), ToggleArg::Query);
     }
 
     #[test]
-    fn parse_toggle_invalid_returns_none() {
-        assert_eq!(parse_toggle("yes"), None);
-        assert_eq!(parse_toggle("no"), None);
-        assert_eq!(parse_toggle("2"), None);
-        assert_eq!(parse_toggle("maybe"), None);
+    fn parse_toggle_invalid() {
+        assert_eq!(parse_toggle("yes"), ToggleArg::Invalid);
+        assert_eq!(parse_toggle("no"), ToggleArg::Invalid);
+        assert_eq!(parse_toggle("2"), ToggleArg::Invalid);
+        assert_eq!(parse_toggle("maybe"), ToggleArg::Invalid);
     }
 
     #[test]

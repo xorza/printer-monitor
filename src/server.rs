@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use tracing::error;
 
 #[derive(Debug, Clone)]
 pub struct ImageServer {
@@ -35,11 +36,18 @@ impl ImageServer {
             .expect("failed to bind image server");
         let addr = listener.local_addr().unwrap();
 
+        // If the server crashes (or the spawned task panics), trip the
+        // cancellation token so the whole app shuts down — the monitor loop
+        // depends on the image server to serve snapshots to Obico.
+        let fail_cancel = cancel.clone();
         tokio::spawn(async move {
-            axum::serve(listener, app)
+            let result = axum::serve(listener, app)
                 .with_graceful_shutdown(async move { cancel.cancelled().await })
-                .await
-                .unwrap();
+                .await;
+            if let Err(e) = result {
+                error!("Image server crashed: {e}");
+            }
+            fail_cancel.cancel();
         });
 
         Self { image_data, addr }

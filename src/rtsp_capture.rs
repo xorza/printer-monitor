@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,13 +22,6 @@ impl RtspCapture {
             "URL must use rtsp:// or rtsps://, got: {rtsp_url}"
         );
         Self { url }
-    }
-
-    /// Capture a single frame and save as JPEG to file.
-    pub async fn capture_to_file(&self, output_path: &Path) -> Result<(), CaptureError> {
-        let jpeg = self.capture().await?;
-        tokio::fs::write(output_path, &jpeg).await?;
-        Ok(())
     }
 
     /// Capture a single frame and return JPEG bytes.
@@ -158,21 +150,5 @@ mod tests {
         let cap = RtspCapture::new("rtsp://prusacam.lan/live");
         let jpeg = cap.capture().await.unwrap();
         assert!(jpeg.len() > 1000, "JPEG too small: {} bytes", jpeg.len());
-    }
-
-    #[tokio::test]
-    #[ignore] // requires live camera at prusacam.lan
-    async fn capture_to_file() {
-        let cap = RtspCapture::new("rtsp://prusacam.lan/live");
-        let path = Path::new("./rtsp_capture_test.jpg");
-        cap.capture_to_file(path).await.unwrap();
-
-        let metadata = std::fs::metadata(path).unwrap();
-        assert!(
-            metadata.len() > 1000,
-            "JPEG too small: {} bytes",
-            metadata.len()
-        );
-        // std::fs::remove_file(path).ok();
     }
 }
