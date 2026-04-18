@@ -1,7 +1,7 @@
 use crate::obico::Detection;
 
 const EWM_ALPHA: f64 = 2.0 / (12.0 + 1.0); // span=12, α=0.1538
-const ROLLING_WIN_LONG: u64 = 7200; // ~20 hours at 10s
+const BASELINE_WINDOW: u64 = 7200; // ~20 hours at 10s
 const GRACE_FRAMES: u64 = 10; // ~100s at POLL_TARGET=10s
 const THRESHOLD_WARNING: f64 = 0.35;
 const THRESHOLD_FAILING: f64 = 0.55;
@@ -16,7 +16,7 @@ pub enum DetectionResult {
 #[derive(Debug)]
 pub struct DetectionState {
     ewm_mean: f64,
-    rolling_mean_long: f64,
+    baseline_mean: f64,
     frame_count: u64,
     lifetime_frame_count: u64,
     current_job_id: Option<u64>,
@@ -27,7 +27,7 @@ impl DetectionState {
     pub fn new(sensitivity: f64) -> Self {
         Self {
             ewm_mean: 0.0,
-            rolling_mean_long: 0.0,
+            baseline_mean: 0.0,
             frame_count: 0,
             lifetime_frame_count: 0,
             current_job_id: None,
@@ -36,12 +36,13 @@ impl DetectionState {
     }
 
     pub fn current_score(&self) -> f64 {
-        ((self.ewm_mean - self.rolling_mean_long) * self.sensitivity).max(0.0)
+        ((self.ewm_mean - self.baseline_mean) * self.sensitivity).max(0.0)
     }
 
-    /// Reset short-term state (EWM, frame count).
-    /// Call when printer stops printing so next print starts clean.
-    pub fn reset_short_term(&mut self) {
+    /// Reset per-print state (EWM, frame count) so the next print starts clean.
+    /// `baseline_mean` and `lifetime_frame_count` are preserved — they track
+    /// the baseline noise floor across all prints.
+    pub fn reset_per_print(&mut self) {
         self.ewm_mean = 0.0;
         self.frame_count = 0;
     }
@@ -53,7 +54,7 @@ impl DetectionState {
         if let Some(id) = job_id
             && self.current_job_id != Some(id)
         {
-            self.reset_short_term();
+            self.reset_per_print();
             self.current_job_id = Some(id);
         }
 
@@ -62,11 +63,11 @@ impl DetectionState {
 
         // Update smoothed signals
         self.ewm_mean = p * EWM_ALPHA + self.ewm_mean * (1.0 - EWM_ALPHA);
-        self.rolling_mean_long = streaming_sma(
-            self.rolling_mean_long,
+        self.baseline_mean = streaming_sma(
+            self.baseline_mean,
             p,
             self.lifetime_frame_count,
-            ROLLING_WIN_LONG,
+            BASELINE_WINDOW,
         );
 
         self.frame_count += 1;
@@ -116,7 +117,7 @@ mod tests {
         for _ in 0..200 {
             state.update(&detections_with_confidence(0.0), None);
         }
-        state.reset_short_term();
+        state.reset_per_print();
 
         // Multiple detections per frame (p=2.5) — high enough to trigger after grace
         let high_dets = vec![detection(0.85), detection(0.85), detection(0.80)];
@@ -155,19 +156,19 @@ mod tests {
     }
 
     #[test]
-    fn rolling_mean_long_math() {
+    fn baseline_mean_math() {
         let mut state = DetectionState::new(1.0);
         // Frame 0: mean = 0 + (0.6 - 0) / min(7200, 1) = 0.6
         state.update(&detections_with_confidence(0.6), None);
-        assert!((state.rolling_mean_long - 0.6).abs() < 1e-10);
+        assert!((state.baseline_mean - 0.6).abs() < 1e-10);
 
         // Frame 1: mean = 0.6 + (0.4 - 0.6) / min(7200, 2) = 0.6 + (-0.2/2) = 0.5
         state.update(&detections_with_confidence(0.4), None);
-        assert!((state.rolling_mean_long - 0.5).abs() < 1e-10);
+        assert!((state.baseline_mean - 0.5).abs() < 1e-10);
 
         // Frame 2: mean = 0.5 + (0.8 - 0.5) / min(7200, 3) = 0.5 + 0.1 = 0.6
         state.update(&detections_with_confidence(0.8), None);
-        assert!((state.rolling_mean_long - 0.6).abs() < 1e-10);
+        assert!((state.baseline_mean - 0.6).abs() < 1e-10);
     }
 
     #[test]
@@ -177,7 +178,7 @@ mod tests {
         for _ in 0..200 {
             state.update(&detections_with_confidence(0.0), None);
         }
-        state.reset_short_term();
+        state.reset_per_print();
 
         // Phase 1: p=0.6 triggers Warning (score ≥ 0.35) but not Failing (< 0.55)
         let moderate_dets = vec![detection(0.3), detection(0.3)];
@@ -218,7 +219,7 @@ mod tests {
 
         // Single spike
         let result = state.update(&detections_with_confidence(0.95), None);
-        // With rolling_mean_long near 0, ewm after one spike:
+        // With baseline_mean near 0, ewm after one spike:
         // ewm = 0.95 * 0.1538 = 0.146 (rest was ~0)
         // score = 0.146 - ~0 = 0.146, below THRESHOLD_WARNING (0.35)
         assert_eq!(result, DetectionResult::Safe);
@@ -231,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn job_id_change_resets_short_term() {
+    fn job_id_change_resets_per_print() {
         let mut state = DetectionState::new(1.0);
         // Build up some state with job 1
         for _ in 0..40 {
@@ -239,9 +240,9 @@ mod tests {
         }
         let ewm_before = state.ewm_mean;
         assert!(ewm_before > 0.5);
-        let long_before = state.rolling_mean_long;
+        let long_before = state.baseline_mean;
 
-        // Switch to job 2 — should reset short-term
+        // Switch to job 2 — should reset per-print state
         state.update(&detections_with_confidence(0.0), Some(2));
         assert!(
             state.ewm_mean < 0.01,
@@ -251,13 +252,13 @@ mod tests {
         assert_eq!(state.frame_count, 1);
         // Long-term should be preserved
         assert!(
-            (state.rolling_mean_long - long_before).abs() < 0.1,
-            "rolling_mean_long should be approximately preserved"
+            (state.baseline_mean - long_before).abs() < 0.1,
+            "baseline_mean should be approximately preserved"
         );
     }
 
     #[test]
-    fn reset_short_term_clears_state() {
+    fn reset_per_print_clears_state() {
         let mut state = DetectionState::new(1.0);
         // Build up state
         for _ in 0..40 {
@@ -266,7 +267,7 @@ mod tests {
         assert!(state.ewm_mean > 0.5);
 
         // Caller resets (e.g. printer goes idle)
-        state.reset_short_term();
+        state.reset_per_print();
         assert!(
             state.ewm_mean < 0.01,
             "ewm should be reset, got {}",
@@ -296,26 +297,26 @@ mod tests {
     fn high_baseline_needs_bigger_spike() {
         // Simulate a printer with high noise floor
         let mut state = DetectionState::new(1.0);
-        // Feed 1000 frames of moderate noise to build up rolling_mean_long
+        // Feed 1000 frames of moderate noise to build up baseline_mean
         for _ in 0..1000 {
             state.update(&detections_with_confidence(0.3), None);
         }
-        // rolling_mean_long should be near 0.3
+        // baseline_mean should be near 0.3
         assert!(
-            (state.rolling_mean_long - 0.3).abs() < 0.05,
+            (state.baseline_mean - 0.3).abs() < 0.05,
             "long mean should be ~0.3, got {}",
-            state.rolling_mean_long
+            state.baseline_mean
         );
 
-        // Reset short-term to simulate new print
-        state.reset_short_term();
+        // Reset per-print state to simulate new print
+        state.reset_per_print();
 
         // Feed moderate confidence that would trigger on a clean printer
         // but shouldn't trigger here because baseline is high
         for _ in 0..50 {
             state.update(&detections_with_confidence(0.5), None);
         }
-        // score = ewm(~0.5) - rolling_mean_long(~0.3) = ~0.2, below THRESHOLD_WARNING
+        // score = ewm(~0.5) - baseline_mean(~0.3) = ~0.2, below THRESHOLD_WARNING
         let result = state.update(&detections_with_confidence(0.5), None);
         assert_eq!(
             result,
@@ -333,8 +334,8 @@ mod tests {
             high.update(&detections_with_confidence(0.0), None);
             normal.update(&detections_with_confidence(0.0), None);
         }
-        high.reset_short_term();
-        normal.reset_short_term();
+        high.reset_per_print();
+        normal.reset_per_print();
 
         // Multiple detections per frame (p=1.4) to ensure triggering
         let dets = vec![detection(0.7), detection(0.7)];

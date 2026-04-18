@@ -397,7 +397,7 @@ async fn poll_printer(state: &AppState) -> Result<Option<StatusResponse>, Monito
         let t = transition(mon.printer_state, current);
         mon.printer_state = current;
         if !matches!(t, Transition::Active) {
-            mon.detection.reset_short_term();
+            mon.detection.reset_per_print();
             mon.alert_level = AlertLevel::Safe;
         }
         t
